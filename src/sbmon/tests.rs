@@ -44,7 +44,7 @@ fn report(node: &str, extra: Value) -> Value {
         "singbox": {"running": true, "version": "1.12.0"},
         "inbounds": [
             {"port": 36980, "type": "shadowsocks", "tag": "ss2022_alice", "users": ["alice"]},
-            {"port": 8443, "type": "vless", "tag": "vless_lf", "users": ["LF"]}
+            {"port": 8443, "type": "vless", "tag": "vless_kim", "users": ["Kim"]}
         ],
         "counters": [],
     });
@@ -447,11 +447,11 @@ fn singbox_stopping_and_agents_going_quiet_are_announced() {
 #[test]
 fn traffic_is_booked_per_user() {
     let (mut e, node, token) = registered("");
-    let ut = |up: u64, down: u64| json!({"user_traffic": [{"tag": "hy2-in", "user": "jasper", "upload": up, "download": down}, {"tag": "hy2-in", "user": "", "upload": 1, "download": 0}]});
+    let ut = |up: u64, down: u64| json!({"user_traffic": [{"tag": "hy2-in", "user": "bob", "upload": up, "download": down}, {"tag": "hy2-in", "user": "", "upload": 1, "download": 0}]});
     e.report(&token, &report(&node, ut(100, 1000)), t0()).unwrap();
     e.report(&token, &report(&node, ut(50, 500)), t0() + Duration::seconds(5)).unwrap();
     let users = e.admin_state(t0())["nodes"][0]["users"].clone();
-    assert_eq!(users[0]["user"], "jasper");
+    assert_eq!(users[0]["user"], "bob");
     assert_eq!(users[0]["today"]["total"], 1650.0);
     assert_eq!(users[0]["month"]["download"], 1500.0);
     assert_eq!(users[1]["user"], "", "connections nobody could be matched to stay visible");

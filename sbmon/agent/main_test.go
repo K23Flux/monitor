@@ -186,13 +186,13 @@ func TestTrackerLiveAndVisits(t *testing.T) {
 		tr.handleLine(ts, id, tag, kind, dir, peer, lineUser(raw), record)
 	}
 	prefix := "1791765813.680464 host sing-box[1]: \x1b[36mINFO\x1b[0m[1] "
-	feed(prefix+"[11 0ms] inbound/shadowsocks[ss2022_wty]: inbound connection from 203.0.113.9:1000", true)
-	feed(prefix+"[11 0ms] inbound/shadowsocks[ss2022_wty]: [WTY] inbound connection to video.example.org:443", true)
-	feed(prefix+"[12 0ms] inbound/shadowsocks[ss2022_wty]: inbound connection from 203.0.113.9:1001", true)
-	feed(prefix+"[12 0ms] inbound/shadowsocks[ss2022_wty]: [WTY] inbound connection to www.apple.com:80", true)
-	feed(prefix+"[13 0ms] inbound/shadowsocks[ss2022_wty]: inbound connection from 198.51.100.4:7", true) // scanner, never routed
+	feed(prefix+"[11 0ms] inbound/shadowsocks[ss2022_zoe]: inbound connection from 203.0.113.9:1000", true)
+	feed(prefix+"[11 0ms] inbound/shadowsocks[ss2022_zoe]: [ZOE] inbound connection to video.example.org:443", true)
+	feed(prefix+"[12 0ms] inbound/shadowsocks[ss2022_zoe]: inbound connection from 203.0.113.9:1001", true)
+	feed(prefix+"[12 0ms] inbound/shadowsocks[ss2022_zoe]: [ZOE] inbound connection to www.apple.com:80", true)
+	feed(prefix+"[13 0ms] inbound/shadowsocks[ss2022_zoe]: inbound connection from 198.51.100.4:7", true) // scanner, never routed
 
-	acc := tr.acc["ss2022_wty"]
+	acc := tr.acc["ss2022_zoe"]
 	if acc == nil || acc.count != 1 || acc.probes != 1 || len(acc.visits) != 1 {
 		t.Fatalf("unexpected accumulator: %#v", acc)
 	}
@@ -200,24 +200,24 @@ func TestTrackerLiveAndVisits(t *testing.T) {
 		t.Fatalf("visit should carry the logged time and host: %#v", acc.visits[0])
 	}
 
-	portOf := map[string]int{"ss2022_wty": 36980}
+	portOf := map[string]int{"ss2022_zoe": 36980}
 	all := map[int]map[string]bool{36980: {"203.0.113.9:1000": true, "203.0.113.9:1001": true, "198.51.100.4:7": true}}
-	if live := tr.liveCounts(all, portOf, 1791765815); live["ss2022_wty"] != 1 {
-		t.Fatalf("only the real destination counts as live, got %d", live["ss2022_wty"])
+	if live := tr.liveCounts(all, portOf, 1791765815); live["ss2022_zoe"] != 1 {
+		t.Fatalf("only the real destination counts as live, got %d", live["ss2022_zoe"])
 	}
 	// The video connection closes: nothing is live, and it is forgotten after the grace.
-	if live := tr.liveCounts(map[int]map[string]bool{}, portOf, 1791765900); live["ss2022_wty"] != 0 || len(tr.conns) != 0 {
+	if live := tr.liveCounts(map[int]map[string]bool{}, portOf, 1791765900); live["ss2022_zoe"] != 0 || len(tr.conns) != 0 {
 		t.Fatalf("closed connections must stop counting: live=%v conns=%d", live, len(tr.conns))
 	}
 
 	// record=false (restart backfill) learns the connection without reporting it.
 	tr.commit()
-	feed(prefix+"[21 0ms] inbound/shadowsocks[ss2022_wty]: inbound connection from 203.0.113.9:2000", false)
-	feed(prefix+"[21 0ms] inbound/shadowsocks[ss2022_wty]: [WTY] inbound connection to video.example.org:443", false)
+	feed(prefix+"[21 0ms] inbound/shadowsocks[ss2022_zoe]: inbound connection from 203.0.113.9:2000", false)
+	feed(prefix+"[21 0ms] inbound/shadowsocks[ss2022_zoe]: [ZOE] inbound connection to video.example.org:443", false)
 	if len(tr.acc) != 0 {
 		t.Fatalf("backfill must not report activity: %#v", tr.acc)
 	}
-	if live := tr.liveCounts(map[int]map[string]bool{36980: {"203.0.113.9:2000": true}}, portOf, 1791765900); live["ss2022_wty"] != 1 {
+	if live := tr.liveCounts(map[int]map[string]bool{36980: {"203.0.113.9:2000": true}}, portOf, 1791765900); live["ss2022_zoe"] != 1 {
 		t.Fatalf("backfilled connection should be live")
 	}
 }
@@ -246,8 +246,8 @@ func TestCollectInboundActivityLiveSocket(t *testing.T) {
 
 	dir := t.TempDir()
 	now := time.Now().Unix()
-	journal := fmt.Sprintf("%d.000001 host sing-box[1]: INFO[1] [77 0ms] inbound/shadowsocks[ss2022_wty]: inbound connection from %s\n"+
-		"%d.000001 host sing-box[1]: INFO[1] [77 0ms] inbound/shadowsocks[ss2022_wty]: [WTY] inbound connection to video.example.org:443\n", now, peer, now)
+	journal := fmt.Sprintf("%d.000001 host sing-box[1]: INFO[1] [77 0ms] inbound/shadowsocks[ss2022_zoe]: inbound connection from %s\n"+
+		"%d.000001 host sing-box[1]: INFO[1] [77 0ms] inbound/shadowsocks[ss2022_zoe]: [ZOE] inbound connection to video.example.org:443\n", now, peer, now)
 	if err := os.WriteFile(filepath.Join(dir, "journal.txt"), []byte(journal), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +258,7 @@ func TestCollectInboundActivityLiveSocket(t *testing.T) {
 	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
 	tracker = newConnTracker()
 	defer func() { tracker = newConnTracker() }()
-	inbounds := []Inbound{{Port: port, Type: "shadowsocks", Tag: "ss2022_wty"}}
+	inbounds := []Inbound{{Port: port, Type: "shadowsocks", Tag: "ss2022_zoe"}}
 
 	first, _ := collectInboundActivity("sing-box", now-5, inbounds)
 	if len(first) != 1 || first[0].ConnCount != 1 || first[0].Live != 1 || !first[0].LiveTracked || len(first[0].Visits) != 1 {
@@ -325,7 +325,7 @@ func TestParseJournalLineWithSingboxTimestamp(t *testing.T) {
 }
 
 func TestParseLogFileLine(t *testing.T) {
-	ts, id, tag, kind, dir, peer, ok := parseLogFileLine("+0800 2026-10-16 13:00:05 INFO [123 0ms] inbound/hysteria2[hy2-in]: [WTY] inbound connection to www.example.org:443", 1)
+	ts, id, tag, kind, dir, peer, ok := parseLogFileLine("+0800 2026-10-16 13:00:05 INFO [123 0ms] inbound/hysteria2[hy2-in]: [ZOE] inbound connection to www.example.org:443", 1)
 	if !ok || id != "123" || tag != "hy2-in" || kind != "" || dir != "to" || peer != "www.example.org:443" {
 		t.Fatalf("got %v %q %q %q %q %q", ok, id, tag, kind, dir, peer)
 	}
@@ -402,11 +402,11 @@ func TestClashUsageAttributesTrafficToUsers(t *testing.T) {
 	}
 	// The log is read at report time, after the connections were seen.
 	feed("INFO [5 0ms] inbound/hysteria2[hy2-in]: inbound connection from 203.0.113.9:4000")
-	feed("INFO [5 0ms] inbound/hysteria2[hy2-in]: [jasper] inbound connection to www.example.org:443")
+	feed("INFO [5 0ms] inbound/hysteria2[hy2-in]: [bob] inbound connection to www.example.org:443")
 	feed("INFO [6 0ms] inbound/hysteria2[hy2-in]: inbound packet connection from [2001:db8::1]:5000")
-	feed("INFO [6 0ms] inbound/hysteria2[hy2-in]: [LF] inbound packet connection to 1.1.1.1:53")
+	feed("INFO [6 0ms] inbound/hysteria2[hy2-in]: [Kim] inbound packet connection to 1.1.1.1:53")
 	got := w.usage(tr)
-	want := []UserTraffic{{"hy2-in", "", 7, 8}, {"hy2-in", "LF", 10, 20}, {"hy2-in", "jasper", 50, 500}}
+	want := []UserTraffic{{"hy2-in", "", 7, 8}, {"hy2-in", "Kim", 10, 20}, {"hy2-in", "bob", 50, 500}}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
@@ -454,25 +454,25 @@ func TestConnLogs(t *testing.T) {
 	}
 	stamp := "+0800 2026-10-16 13:00:05 INFO "
 	feed(stamp+"[1 0ms] inbound/shadowsocks[ss_multi]: inbound connection from 203.0.113.9:1000", true)
-	feed(stamp+"[1 0ms] inbound/shadowsocks[ss_multi]: [WTY] inbound connection to video.example.org:443", true)
-	feed(stamp+"[2 0ms] inbound/hysteria2[hy2_wty]: inbound packet connection from [2001:db8::1]:5000", true)
-	feed(stamp+"[2 0ms] inbound/hysteria2[hy2_wty]: inbound packet connection to 1.1.1.1:53", true)
+	feed(stamp+"[1 0ms] inbound/shadowsocks[ss_multi]: [ZOE] inbound connection to video.example.org:443", true)
+	feed(stamp+"[2 0ms] inbound/hysteria2[hy2_zoe]: inbound packet connection from [2001:db8::1]:5000", true)
+	feed(stamp+"[2 0ms] inbound/hysteria2[hy2_zoe]: inbound packet connection to 1.1.1.1:53", true)
 	feed(stamp+"[3 0ms] inbound/vless[vless]: inbound multiplex connection from 198.51.100.7:9", true)
-	feed(stamp+"[3 0ms] inbound/vless[vless]: [LF] inbound multiplex connection to sp.mux.sing-box.arpa:444", true)
-	feed(stamp+"[4 0ms] inbound/vless[vless]: [LF] inbound connection to www.gstatic.com:443", true)
+	feed(stamp+"[3 0ms] inbound/vless[vless]: [Kim] inbound multiplex connection to sp.mux.sing-box.arpa:444", true)
+	feed(stamp+"[4 0ms] inbound/vless[vless]: [Kim] inbound connection to www.gstatic.com:443", true)
 	// Restart backfill is not logged.
 	feed(stamp+"[5 0ms] inbound/shadowsocks[ss_multi]: inbound connection from 203.0.113.9:2000", false)
-	feed(stamp+"[5 0ms] inbound/shadowsocks[ss_multi]: [WTY] inbound connection to old.example.org:443", false)
+	feed(stamp+"[5 0ms] inbound/shadowsocks[ss_multi]: [ZOE] inbound connection to old.example.org:443", false)
 
-	inbounds := []Inbound{{Tag: "ss_multi", Users: []string{"WTY", "LF"}}, {Tag: "hy2_wty", Users: []string{"wty"}}, {Tag: "vless", Users: []string{"LF", "x"}}}
+	inbounds := []Inbound{{Tag: "ss_multi", Users: []string{"ZOE", "Kim"}}, {Tag: "hy2_zoe", Users: []string{"zoe"}}, {Tag: "vless", Users: []string{"Kim", "x"}}}
 	logs, dropped := tr.connLogs(inbounds)
 	if dropped != 0 || len(logs) != 3 {
 		t.Fatalf("want 3 logs (mux carrier and backfill left out), got %d %#v", len(logs), logs)
 	}
 	want := []ConnLog{
-		{T: 1792126805, Tag: "ss_multi", User: "WTY", Src: "203.0.113.9:1000", Dst: "video.example.org:443", Net: "tcp"},
-		{T: 1792126805, Tag: "hy2_wty", User: "wty", Src: "[2001:db8::1]:5000", Dst: "1.1.1.1:53", Net: "udp"},
-		{T: 1792126805, Tag: "vless", User: "LF", Dst: "www.gstatic.com:443", Net: "tcp", Probe: true},
+		{T: 1792126805, Tag: "ss_multi", User: "ZOE", Src: "203.0.113.9:1000", Dst: "video.example.org:443", Net: "tcp"},
+		{T: 1792126805, Tag: "hy2_zoe", User: "zoe", Src: "[2001:db8::1]:5000", Dst: "1.1.1.1:53", Net: "udp"},
+		{T: 1792126805, Tag: "vless", User: "Kim", Dst: "www.gstatic.com:443", Net: "tcp", Probe: true},
 	}
 	for i := range want {
 		if logs[i] != want[i] {

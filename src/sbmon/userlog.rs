@@ -3,7 +3,7 @@
 //! `userlog/<node>/<YYYY-MM-DD>.jsonl`, for a few days only.
 //!
 //! The panel asks for one user on one day; user names compare without regard
-//! to case, since the same person is often `WTY` on one server and `wty` on
+//! to case, since the same person is often `ZOE` on one server and `zoe` on
 //! another.
 
 use std::collections::{BTreeMap, HashMap};
@@ -215,7 +215,7 @@ mod tests {
         let config = Config::default(); // UTC+8
         let body = json!({
             "conns": [
-                {"t": now().timestamp() - 60, "tag": "ss", "user": "WTY", "src": "1.2.3.4:5", "dst": "a.example:443", "net": "tcp"},
+                {"t": now().timestamp() - 60, "tag": "ss", "user": "ZOE", "src": "1.2.3.4:5", "dst": "a.example:443", "net": "tcp"},
                 {"t": 1, "tag": "hy2", "user": "", "dst": "1.1.1.1:53", "net": "weird", "probe": true},
                 {"t": now().timestamp(), "tag": "", "dst": "x:1"},
                 {"t": now().timestamp(), "tag": "ss", "dst": ""},
@@ -228,7 +228,7 @@ mod tests {
         let today: Vec<Value> =
             lines["2026-10-16"].iter().map(|l| serde_json::from_str(l).unwrap()).collect();
         assert_eq!(today.len(), 4, "{today:?}");
-        assert_eq!(today[0]["user"], "WTY");
+        assert_eq!(today[0]["user"], "ZOE");
         // A wild clock is booked at receipt time; an unknown net is tcp.
         assert_eq!(today[1]["t"], now().timestamp());
         assert_eq!(today[1]["net"], "tcp");
@@ -250,9 +250,9 @@ mod tests {
         write(
             "n1",
             &[
-                json!({"t": 10, "tag": "ss", "user": "WTY", "src": "1.2.3.4:5", "dst": "video.example.org:443", "net": "tcp"}),
-                json!({"t": 20, "tag": "ss", "user": "LF", "dst": "lf.example:443", "net": "tcp"}),
-                json!({"t": 30, "tag": "ss", "user": "WTY", "dst": "www.gstatic.com:443", "net": "tcp", "probe": true}),
+                json!({"t": 10, "tag": "ss", "user": "ZOE", "src": "1.2.3.4:5", "dst": "video.example.org:443", "net": "tcp"}),
+                json!({"t": 20, "tag": "ss", "user": "Kim", "dst": "kim.example:443", "net": "tcp"}),
+                json!({"t": 30, "tag": "ss", "user": "ZOE", "dst": "www.gstatic.com:443", "net": "tcp", "probe": true}),
                 json!({"t": 31, "dropped": 4}),
                 Value::String("not json".into()),
             ],
@@ -260,7 +260,7 @@ mod tests {
         write(
             "n2",
             &[
-                json!({"t": 40, "tag": "hy2_wty", "user": "wty", "dst": "video.example.org:443", "net": "udp"}),
+                json!({"t": 40, "tag": "hy2_zoe", "user": "zoe", "dst": "video.example.org:443", "net": "udp"}),
                 json!({"t": 50, "tag": "hy2", "user": "", "dst": "[2001:db8::1]:443", "net": "udp"}),
             ],
         );
@@ -268,7 +268,7 @@ mod tests {
         let filter =
             |user: &str, search: &str, probes| Filter { user: user.into(), search: search.into(), probes };
 
-        let r = query(&dir, &nodes, "2026-10-16", &filter("wty", "", false));
+        let r = query(&dir, &nodes, "2026-10-16", &filter("zoe", "", false));
         assert_eq!(r["total"], 2);
         assert_eq!(r["probes"], 1);
         assert_eq!(r["dropped"], 4);
@@ -278,10 +278,10 @@ mod tests {
         // The users seen that day, one entry per name ignoring case.
         let users: Vec<&str> =
             r["users"].as_array().unwrap().iter().map(|u| u["user"].as_str().unwrap()).collect();
-        assert_eq!(users, ["", "LF", "WTY"]);
+        assert_eq!(users, ["", "Kim", "ZOE"]);
 
-        assert_eq!(query(&dir, &nodes, "2026-10-16", &filter("wty", "", true))["total"], 3);
-        assert_eq!(query(&dir, &nodes, "2026-10-16", &filter("wty", "1.2.3", false))["total"], 1);
+        assert_eq!(query(&dir, &nodes, "2026-10-16", &filter("zoe", "", true))["total"], 3);
+        assert_eq!(query(&dir, &nodes, "2026-10-16", &filter("zoe", "1.2.3", false))["total"], 1);
         let unknown = query(&dir, &nodes, "2026-10-16", &filter(UNKNOWN_USER, "", false));
         assert_eq!(unknown["total"], 1);
         assert_eq!(unknown["hosts"][0]["host"], "2001:db8::1");

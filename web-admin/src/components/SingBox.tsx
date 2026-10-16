@@ -373,7 +373,7 @@ function UserLink({ user, onOpen, className = "" }: { user: string; onOpen: (use
 
 /**
  * One user's connections on one day: which server and inbound, from where,
- * to where. Names match ignoring case, so WTY on one server and wty on
+ * to where. Names match ignoring case, so ZOE on one server and zoe on
  * another are one person. Today's log refreshes every 10 seconds.
  */
 export function UserLogDialog({ user: initialUser, nodeId: initialNode = "", onClose }: { user: string; nodeId?: string; onClose: () => void }) {
