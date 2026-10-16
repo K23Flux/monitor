@@ -640,6 +640,7 @@ async fn main() -> Result<()> {
     // to a node that reports again under the same boot, but a node rebooting
     // while the hub is down would take them with it.
     agent_ws::book_held(&held, None);
+    held.sbmon.save();
     Ok(())
 }
 
