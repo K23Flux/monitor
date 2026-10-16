@@ -43,6 +43,8 @@ type SbNode = {
   singbox: { running: boolean; version: string }
   ports: Port[]
   hubNodeId: number | null
+  watchUsers: boolean
+  singboxDownSince: string | null
 }
 type SbEvent = { id: string; nodeName: string; time: string; level: string; message: string }
 type SbState = {
@@ -391,14 +393,32 @@ export function SingBox({ hubNodes }: { hubNodes: HubNode[] }) {
             <div className="flex min-w-0 items-center gap-2.5">
               <span className={`size-2 shrink-0 rounded-full ${node.online ? "bg-emerald-500" : "bg-red-500"}`} />
               <div className="min-w-0">
-                <div className="font-medium">{node.name}</div>
+                <div className="flex items-center gap-2 font-medium">
+                  {node.name}
+                  {node.online && !node.singbox.running && <Badge variant="destructive">sing-box 未运行</Badge>}
+                </div>
                 <div className="truncate text-xs text-muted-foreground">
                   {node.hostname || "等待首次上报"} · {node.singbox.version || "sing-box 版本未知"}
-                  {!node.singbox.running && node.lastSeen && " · sing-box 未运行"} · sb-agent {node.agentVersion || "?"} · 最后上报 {when(node.lastSeen)}
+                  {" · sb-agent"} {node.agentVersion || "?"} · 最后上报 {when(node.lastSeen)}
                 </div>
               </div>
             </div>
-            <div className="flex gap-1">
+            <div className="flex flex-wrap items-center gap-1">
+              <label className="mr-2 flex items-center gap-1.5 text-xs" title="关掉后这台只统计端口流量，不判断用户上线 / 下线，也不发相关通知">
+                <Switch
+                  checked={node.watchUsers}
+                  onCheckedChange={async (v) => {
+                    try {
+                      await post("/node/watch", { node_id: node.id, enabled: v })
+                      toast.success(v ? "已开启用户监测" : "已关闭用户监测")
+                      reload()
+                    } catch (e) {
+                      toast.error((e as Error).message)
+                    }
+                  }}
+                />
+                监测用户
+              </label>
               {node.hubNodeId != null ? (
                 <Badge variant="secondary" title="名字跟着「节点」页走">随探针安装</Badge>
               ) : (
@@ -681,7 +701,7 @@ function WatchSettings({ onSaved }: { onSaved: () => void }) {
       <div>
         <h3 className="text-sm font-medium">监控设置</h3>
         <p className="mt-1 text-xs text-muted-foreground">
-          {"这里的 Telegram 机器人只发连接监控的上线、下线通知，和「通知」页的节点告警分开。"}
+          {"这里的 Telegram 机器人发连接监控的上线、下线通知，以及 sing-box 停止、sb-agent 失联的提醒；和「通知」页的整机告警分开。"}
         </p>
       </div>
       <div className="space-y-1.5">
@@ -738,10 +758,10 @@ function WatchSettings({ onSaved }: { onSaved: () => void }) {
         {field("history_days", "分钟历史保留天数", "30")}
       </div>
       <div className="flex flex-wrap gap-6">
-        {(["notify_online", "notify_offline"] as const).map((k) => (
+        {(["notify_online", "notify_offline", "notify_status"] as const).map((k) => (
           <label key={k} className="flex items-center gap-2 text-sm">
             <Switch checked={(form[k] ?? "") !== "false"} onCheckedChange={(v) => set(k, v ? "true" : "false")} />
-            {k === "notify_online" ? "上线时通知" : "下线时通知"}
+            {k === "notify_online" ? "上线时通知" : k === "notify_offline" ? "下线时通知" : "sing-box 停止 / sb-agent 失联时通知"}
           </label>
         ))}
       </div>

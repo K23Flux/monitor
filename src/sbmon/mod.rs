@@ -54,6 +54,10 @@ struct AgentBinaries;
 
 pub struct Sbmon {
     engine: Mutex<Engine>,
+    /// Reports changed the state since it was last written. Reports arrive every
+    /// five seconds per node and mostly move counters, so they are saved with
+    /// the next ten-second tick; alerts and user events are saved at once.
+    dirty: AtomicBool,
     dir: PathBuf,
     flushing: AtomicBool,
     wake: tokio::sync::Notify,
@@ -88,6 +92,7 @@ impl Sbmon {
             engine: Mutex::new(Engine::new(state, config_from_db(db))),
             dir,
             flushing: AtomicBool::new(false),
+            dirty: AtomicBool::new(false),
             wake: tokio::sync::Notify::new(),
         })
     }
@@ -99,6 +104,7 @@ impl Sbmon {
     /// Writes the state through a temporary file, so a crash mid-write leaves
     /// the previous copy.
     fn persist(&self, engine: &mut Engine) {
+        self.dirty.store(false, Ordering::Release);
         engine.state.updated_at = engine::iso(Utc::now());
         let file = self.dir.join("state.json");
         let temp = self.dir.join("state.json.tmp");
@@ -135,13 +141,15 @@ pub async fn run(app: Shared) {
         ticks += 1;
         let now = Utc::now();
         let sb = &app.sbmon;
+        let offline = hub_offline(&app);
         let queued = {
             let mut engine = sb.lock();
-            let before = engine.state.pending.len();
-            if engine.check_offline(now) {
+            let before = engine.notable;
+            let changed = engine.check_offline(now) | engine.check_status(now, &offline);
+            if changed || sb.dirty.load(Ordering::Acquire) {
                 sb.persist(&mut engine);
             }
-            engine.state.pending.len() > before
+            engine.notable != before
         };
         if queued {
             sb.wake.notify_one();
@@ -163,6 +171,16 @@ pub async fn run(app: Shared) {
             }
         }
     }
+}
+
+/// Hub nodes whose own monitor agent is not connected right now.
+fn hub_offline(app: &App) -> std::collections::HashSet<i64> {
+    let connected: std::collections::HashSet<i64> =
+        app.agents.read().map(|a| a.keys().copied().collect()).unwrap_or_default();
+    app.db
+        .nodes()
+        .map(|nodes| nodes.into_iter().map(|n| n.id).filter(|id| !connected.contains(id)).collect())
+        .unwrap_or_default()
 }
 
 fn append_line(file: &Path, line: &str) -> Result<()> {
@@ -340,9 +358,18 @@ fn sync_hub(app: &App) {
         }
     };
     let sb = &app.sbmon;
-    let mut engine = sb.lock();
-    if engine.sync_hub_nodes(&names) {
-        sb.persist(&mut engine);
+    let gone = {
+        let mut engine = sb.lock();
+        let (changed, gone) = engine.sync_hub_nodes(&names);
+        if changed {
+            sb.persist(&mut engine);
+        }
+        gone
+    };
+    for id in gone {
+        if id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let _ = std::fs::remove_dir_all(sb.dir.join("history").join(&id));
+        }
     }
 }
 
@@ -351,12 +378,14 @@ async fn agent_report(State(app): State<Shared>, headers: HeaderMap, body: Bytes
     let sb = &app.sbmon;
     let (result, queued) = {
         let mut engine = sb.lock();
-        let before = engine.state.pending.len();
+        let before = engine.notable;
         let result = engine.report(&bearer(&headers), &body, Utc::now());
-        if result.is_ok() {
+        let queued = engine.notable != before;
+        if queued {
             sb.persist(&mut engine);
+        } else if result.is_ok() {
+            sb.dirty.store(true, Ordering::Release);
         }
-        let queued = engine.state.pending.len() > before;
         (result, queued)
     };
     if queued {
@@ -491,6 +520,16 @@ async fn link_node(_: Admin, State(app): State<Shared>, Json(body): Json<LinkBod
     edit(&app, |e| e.link_node(&body.node_id, hub.as_ref().map(|(id, name)| (*id, name.as_str()))))
 }
 
+#[derive(Deserialize)]
+struct WatchBody {
+    node_id: String,
+    enabled: bool,
+}
+
+async fn set_watch(_: Admin, State(app): State<Shared>, Json(body): Json<WatchBody>) -> Response {
+    edit(&app, |e| e.set_watch(&body.node_id, body.enabled))
+}
+
 async fn delete_node(_: Admin, State(app): State<Shared>, Json(body): Json<NodeBody>) -> Response {
     let result = edit(&app, |e| e.delete_node(&body.node_id));
     if result.status().is_success()
@@ -575,7 +614,7 @@ fn config_error(key: &str, value: &str) -> Option<String> {
         "session_idle_seconds" => number(30.0, 86400.0, "空闲判定秒数"),
         "offline_grace_seconds" => number(10.0, 3600.0, "下线确认秒数"),
         "online_confirm_seconds" => number(0.0, 600.0, "上线确认秒数"),
-        "notify_online" | "notify_offline" if !matches!(value, "" | "true" | "false") => {
+        "notify_online" | "notify_offline" | "notify_status" if !matches!(value, "" | "true" | "false") => {
             Some(format!("{key} 只能是 true 或 false"))
         }
         "tg_bot_token" if !value.is_empty() && !value.contains(':') => {
@@ -643,6 +682,7 @@ pub fn admin_routes() -> Router<Shared> {
         .route(&format!("{API}/admin/node/alias"), post(set_alias))
         .route(&format!("{API}/admin/node/delete"), post(delete_node))
         .route(&format!("{API}/admin/node/link"), post(link_node))
+        .route(&format!("{API}/admin/node/watch"), post(set_watch))
         .route(&format!("{API}/admin/telegram/test"), post(test_telegram))
 }
 

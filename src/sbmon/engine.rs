@@ -27,6 +27,11 @@ pub const TG_CHUNK: usize = 3500;
 /// `AGENT_LOST_MS` the session is closed with a note.
 const AGENT_SILENT_MS: i64 = 30_000;
 const AGENT_LOST_MS: i64 = 600_000;
+/// How long sing-box may be reported stopped before an alert: a restart takes
+/// seconds, and an alert for every config reload would be noise.
+const STATUS_GRACE_MS: i64 = 60_000;
+/// How long an sb-agent may stay silent before an alert.
+const AGENT_LOST_ALERT_MS: i64 = 300_000;
 /// Daily traffic buckets older than this are dropped. The plugin kept them
 /// forever; the panel only ever reads today and this month.
 const DAILY_KEEP_DAYS: i64 = 400;
@@ -131,6 +136,8 @@ pub struct Config {
     pub tg_chat_id: String,
     pub notify_online: bool,
     pub notify_offline: bool,
+    /// sing-box stopped / recovered and sb-agent lost / back, through the same bot.
+    pub notify_status: bool,
 }
 
 impl Default for Config {
@@ -141,7 +148,7 @@ impl Default for Config {
 
 /// Every setting the module keeps, under its Komari plugin key. Stored in the
 /// hub's `setting` table with an `sbmon_` prefix.
-pub const CONFIG_KEYS: [&str; 11] = [
+pub const CONFIG_KEYS: [&str; 12] = [
     "timezone_offset",
     "offline_seconds",
     "history_days",
@@ -153,6 +160,7 @@ pub const CONFIG_KEYS: [&str; 11] = [
     "tg_chat_id",
     "notify_online",
     "notify_offline",
+    "notify_status",
 ];
 
 fn clamp_number(value: Option<String>, fallback: f64, min: f64, max: f64) -> f64 {
@@ -200,6 +208,7 @@ impl Config {
             tg_chat_id: clean_text(&get("tg_chat_id").unwrap_or_default(), 60).trim().to_owned(),
             notify_online: switch("notify_online"),
             notify_offline: switch("notify_offline"),
+            notify_status: switch("notify_status"),
         }
     }
 
@@ -248,6 +257,7 @@ impl Config {
             "tgConfigured": self.telegram_configured(),
             "notifyOnline": self.notify_online,
             "notifyOffline": self.notify_offline,
+            "notifyStatus": self.notify_status,
         })
     }
 }
@@ -311,6 +321,19 @@ pub struct Node {
     /// Such a node takes its name from the hub node and goes when that node does.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hub_node_id: Option<i64>,
+    /// Watching users is switched off for this server in the panel: its
+    /// inbounds are still counted, but nobody on it goes online or offline.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub watch_off: bool,
+    /// When sing-box was first reported stopped, for as long as it stays stopped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub singbox_down_since: Option<String>,
+    /// A stop alert went out for the current outage.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub singbox_down_alerted: bool,
+    /// An alert went out that this sb-agent stopped reporting.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub agent_lost_alerted: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -441,6 +464,10 @@ pub struct HistoryLine {
 pub struct Engine {
     pub state: State,
     pub config: Config,
+    /// Counts alerts queued and user events recorded, which are written to disk
+    /// at once; everything else waits for the next periodic save. A counter
+    /// rather than the queue's length, which stops growing at its cap.
+    pub notable: u64,
 }
 
 fn watch_key(node_id: &str, tag: &str) -> String {
@@ -551,7 +578,7 @@ struct Activity {
 
 impl Engine {
     pub fn new(state: State, config: Config) -> Self {
-        Self { state, config }
+        Self { state, config, notable: 0 }
     }
 
     fn push_user_event(
@@ -562,6 +589,7 @@ impl Engine {
         time: &str,
         domains: Vec<String>,
     ) -> &mut UserEvent {
+        self.notable += 1;
         self.state.user_events.push(UserEvent {
             id: random_hex(8),
             kind: kind.into(),
@@ -582,6 +610,7 @@ impl Engine {
     }
 
     pub fn enqueue_telegram(&mut self, text: String, now: DateTime<Utc>) {
+        self.notable += 1;
         self.state.pending.push(Pending { text, at: iso(now) });
         if self.state.pending.len() > MAX_PENDING {
             let drop = self.state.pending.len() - MAX_PENDING;
@@ -666,6 +695,7 @@ impl Engine {
         // Traffic deltas against the previous totals, booked by receipt time:
         // an agent's clock must not create arbitrary daily buckets.
         let mut deltas = Vec::new();
+        let mut status = Vec::new();
         {
             let node = self.state.nodes.get_mut(&node_id).expect("authed");
             let field = |k: &str| text(body.get(k).unwrap_or(&Value::Null));
@@ -683,6 +713,24 @@ impl Engine {
                 ),
             };
             node.inbounds = inbounds;
+            if node.agent_lost_alerted {
+                node.agent_lost_alerted = false;
+                status.push(format!("\u{2705} <b>sb-agent 恢复上报</b>\n节点  {}", escape_html(&node.name)));
+            }
+            if node.singbox.running {
+                if node.singbox_down_alerted {
+                    let since = node.singbox_down_since.clone().unwrap_or_else(|| now_iso.clone());
+                    status.push(format!(
+                        "\u{1F7E2} <b>sing-box 已恢复</b>\n节点  {}\n停了  {}",
+                        escape_html(&node.name),
+                        human_duration(&since, &now_iso)
+                    ));
+                }
+                node.singbox_down_since = None;
+                node.singbox_down_alerted = false;
+            } else if node.singbox_down_since.is_none() {
+                node.singbox_down_since = Some(now_iso.clone());
+            }
             let mut next = BTreeMap::new();
             for counter in counters {
                 let key = port_key(&json!(counter.port));
@@ -706,6 +754,9 @@ impl Engine {
         }
         for (port, up, down) in deltas {
             self.add_daily(&node_id, &port, up, down, now);
+        }
+        for text in status {
+            self.enqueue_telegram(text, now);
         }
 
         if let Some(events) = body.get("events").and_then(Value::as_array) {
@@ -837,6 +888,9 @@ impl Engine {
     /// open; `check_offline` handles the offline transition.
     fn handle_activity(&mut self, node_id: &str, tag: &str, info: Activity, now: DateTime<Utc>) {
         let Some(rule) = self.config.rule_for(tag).cloned() else { return };
+        if self.state.nodes.get(node_id).is_some_and(|n| n.watch_off) {
+            return;
+        }
         let key = watch_key(node_id, tag);
         if info.conn <= 0 && info.live <= 0 {
             if let Some(watch) = self.state.watch.get_mut(&key) {
@@ -1117,6 +1171,8 @@ impl Engine {
             "ports": ports,
             "lastActivity": node.last_activity,
             "hubNodeId": node.hub_node_id,
+            "watchUsers": !node.watch_off,
+            "singboxDownSince": node.singbox_down_since,
         })
     }
 
@@ -1152,7 +1208,7 @@ impl Engine {
     /// their first connection.
     pub fn admin_watch(&self, now: DateTime<Utc>) -> Value {
         let mut rows: BTreeMap<String, serde_json::Map<String, Value>> = BTreeMap::new();
-        for node in self.state.nodes.values() {
+        for node in self.state.nodes.values().filter(|n| !n.watch_off) {
             let node_online = self.node_online(node, now);
             for inbound in &node.inbounds {
                 let Some(rule) = self.config.rule_for(&inbound.tag) else { continue };
@@ -1265,10 +1321,22 @@ impl Engine {
     }
 
     /// Follows the hub's node list: a linked node takes its hub node's name, and
-    /// one whose hub node was deleted is deleted too. Returns whether anything changed.
-    pub fn sync_hub_nodes(&mut self, names: &BTreeMap<i64, String>) -> bool {
+    /// one whose hub node was deleted is deleted too. A node registered on its
+    /// own (a one-time key, or carried over from Komari) whose name matches a
+    /// hub node nobody is linked to yet is linked to it. Returns whether
+    /// anything changed and the nodes deleted, whose history files go too.
+    pub fn sync_hub_nodes(&mut self, names: &BTreeMap<i64, String>) -> (bool, Vec<String>) {
         let mut changed = false;
         let mut gone = Vec::new();
+        let mut taken: BTreeSet<i64> = self.state.nodes.values().filter_map(|n| n.hub_node_id).collect();
+        for node in self.state.nodes.values_mut().filter(|n| n.hub_node_id.is_none()) {
+            let found = names.iter().find(|(id, name)| !taken.contains(id) && clean_name(name) == node.name);
+            if let Some((&id, _)) = found {
+                node.hub_node_id = Some(id);
+                taken.insert(id);
+                changed = true;
+            }
+        }
         for node in self.state.nodes.values_mut() {
             let Some(hub_id) = node.hub_node_id else { continue };
             match names.get(&hub_id) {
@@ -1280,9 +1348,63 @@ impl Engine {
                 Some(_) => {}
             }
         }
-        for id in gone {
-            let _ = self.delete_node(&id);
+        for id in &gone {
+            let _ = self.delete_node(id);
             changed = true;
+        }
+        (changed, gone)
+    }
+
+    /// Switches watching users on this server on or off. Switched off, any
+    /// session in progress there is dropped without an alert.
+    pub fn set_watch(&mut self, node_id: &str, enabled: bool) -> Result<(), &'static str> {
+        let node = self.state.nodes.get_mut(node_id).ok_or("节点不存在")?;
+        node.watch_off = !enabled;
+        if !enabled {
+            self.state.watch.retain(|_, w| w.node_id != node_id);
+        }
+        Ok(())
+    }
+
+    /// sing-box stopped for longer than [`STATUS_GRACE_MS`], and sb-agents silent
+    /// for [`AGENT_LOST_ALERT_MS`] while their machine is still up (`hub_offline`
+    /// lists hub nodes whose own agent is down; the hub alerts for those).
+    /// Returns whether anything changed.
+    pub fn check_status(&mut self, now: DateTime<Utc>, hub_offline: &HashSet<i64>) -> bool {
+        if !self.config.notify_status {
+            return false;
+        }
+        let now_ms = now.timestamp_millis();
+        let mut alerts = Vec::new();
+        for node in self.state.nodes.values_mut() {
+            let seen = node.last_seen.as_deref().and_then(millis);
+            let silent = seen.map_or(0, |s| now_ms - s);
+            if seen.is_some()
+                && silent > AGENT_LOST_ALERT_MS
+                && !node.agent_lost_alerted
+                && !node.hub_node_id.is_some_and(|id| hub_offline.contains(&id))
+            {
+                node.agent_lost_alerted = true;
+                alerts.push(format!(
+                    "\u{26A0}\u{FE0F} <b>sb-agent 失联</b>\n节点  {}\n最后上报  {}\n机器本身还在线，多半是 sb-agent 停了：systemctl status sb-agent",
+                    escape_html(&node.name),
+                    self.config.local_label(node.last_seen.as_deref().unwrap_or_default(), true)
+                ));
+            }
+            // Judged only while the agent reports: a silent agent says nothing about sing-box.
+            let Some(since) = node.singbox_down_since.as_deref().and_then(millis) else { continue };
+            if !node.singbox_down_alerted && silent <= AGENT_SILENT_MS && now_ms - since > STATUS_GRACE_MS {
+                node.singbox_down_alerted = true;
+                alerts.push(format!(
+                    "\u{1F534} <b>sing-box 已停止</b>\n节点  {}\n从  {} 起",
+                    escape_html(&node.name),
+                    self.config.local_label(node.singbox_down_since.as_deref().unwrap_or_default(), true)
+                ));
+            }
+        }
+        let changed = !alerts.is_empty();
+        for text in alerts {
+            self.enqueue_telegram(text, now);
         }
         changed
     }

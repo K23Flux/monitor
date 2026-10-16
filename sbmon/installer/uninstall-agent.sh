@@ -7,9 +7,11 @@ if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
 fi
 
 systemctl disable --now sb-agent.service 2>/dev/null || true
-rm -f /etc/systemd/system/sb-agent.service
+rc-service sb-agent stop 2>/dev/null || true
+rc-update del sb-agent default >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/sb-agent.service /etc/init.d/sb-agent
 rm -f /usr/local/bin/sb-agent
-systemctl daemon-reload
+systemctl daemon-reload 2>/dev/null || true
 
 echo "sb-agent 已卸载。"
 echo "配置和累计状态仍保留在 /etc/sb-agent 与 /var/lib/sb-agent。"

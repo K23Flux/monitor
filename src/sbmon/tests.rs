@@ -345,11 +345,11 @@ fn linked_nodes_follow_the_hubs_node_list() {
         .unwrap()
         .to_owned();
     let mut names = std::collections::BTreeMap::from([(7, "Tokyo".to_owned())]);
-    assert!(e.sync_hub_nodes(&names));
+    assert!(e.sync_hub_nodes(&names).0);
     assert_eq!(e.state.nodes[&id].name, "Tokyo");
-    assert!(!e.sync_hub_nodes(&names), "nothing left to change");
+    assert!(!e.sync_hub_nodes(&names).0, "nothing left to change");
     names.clear();
-    assert!(e.sync_hub_nodes(&names));
+    assert!(e.sync_hub_nodes(&names).0);
     assert!(!e.state.nodes.contains_key(&id), "deleted with its hub node");
     assert!(e.state.nodes.contains_key(&own), "a node registered on its own stays");
 }
@@ -364,4 +364,82 @@ fn an_existing_node_can_be_linked_by_hand() {
     assert!(e.link_node(&other, Some((3, "Node HK"))).is_err(), "one sing-box per hub node");
     e.link_node(&node, None).unwrap();
     assert_eq!(e.state.nodes[&node].hub_node_id, None);
+}
+
+#[test]
+fn a_node_registered_on_its_own_links_by_name() {
+    let (mut e, node, _) = registered("");
+    let names = std::collections::BTreeMap::from([(9, "demo-node-01".to_owned()), (10, "other".to_owned())]);
+    assert!(e.sync_hub_nodes(&names).0);
+    assert_eq!(e.state.nodes[&node].hub_node_id, Some(9));
+}
+
+#[test]
+fn watching_can_be_switched_off_per_server() {
+    let (mut e, node, token) = registered("ss2022_alice=alice");
+    e.report(&token, &report(&node, json!({"activity": activity(2, 2, &[("a.example", t0())])})), t0())
+        .unwrap();
+    assert_eq!(row(&e, t0())["online"], true);
+    let queued = e.state.pending.len();
+    e.set_watch(&node, false).unwrap();
+    assert!(
+        e.admin_watch(t0())["watched"].as_array().unwrap().is_empty(),
+        "no rows for a server not watched"
+    );
+    e.report(&token, &report(&node, json!({"activity": activity(3, 3, &[("b.example", t0())])})), t0())
+        .unwrap();
+    e.check_offline(t0() + Duration::minutes(20));
+    assert_eq!(e.state.pending.len(), queued, "nothing is announced for it");
+    assert_eq!(e.admin_state(t0())["nodes"][0]["watchUsers"], false);
+    e.set_watch(&node, true).unwrap();
+    e.report(&token, &report(&node, json!({"activity": activity(2, 2, &[("c.example", t0())])})), t0())
+        .unwrap();
+    assert_eq!(row(&e, t0())["online"], true);
+}
+
+#[test]
+fn singbox_stopping_and_agents_going_quiet_are_announced() {
+    let (mut e, node, token) = registered("");
+    let none = std::collections::HashSet::new();
+    let down = |b: Value| {
+        let mut b = b;
+        b["singbox"]["running"] = json!(false);
+        b
+    };
+    let mut now = t0();
+    e.report(&token, &report(&node, json!({})), now).unwrap();
+    // A restart shorter than the grace says nothing.
+    now += Duration::seconds(5);
+    e.report(&token, &down(report(&node, json!({}))), now).unwrap();
+    now += Duration::seconds(5);
+    e.report(&token, &report(&node, json!({})), now).unwrap();
+    e.check_status(now + Duration::seconds(70), &none);
+    assert!(e.state.pending.is_empty());
+    // Stopped for good: one alert, then one when it is back.
+    for _ in 0..16 {
+        now += Duration::seconds(5);
+        e.report(&token, &down(report(&node, json!({}))), now).unwrap();
+        e.check_status(now, &none);
+    }
+    assert_eq!(e.state.pending.len(), 1);
+    assert!(e.state.pending[0].text.contains("sing-box 已停止"));
+    now += Duration::seconds(5);
+    e.report(&token, &report(&node, json!({})), now).unwrap();
+    assert!(e.state.pending[1].text.contains("sing-box 已恢复"), "{}", e.state.pending[1].text);
+    // The agent goes quiet: alerted once after five minutes, not while the machine is down.
+    let hub = e.register_linked(4, "linked", &json!({}), now)["node_id"].as_str().unwrap().to_owned();
+    let tok2 = e.register_linked(4, "linked", &json!({}), now)["agent_token"].as_str().unwrap().to_owned();
+    e.report(&tok2, &report(&hub, json!({})), now).unwrap();
+    let before = e.state.pending.len();
+    e.check_status(now + Duration::minutes(6), &std::collections::HashSet::from([4]));
+    let lost: Vec<_> = e.state.pending[before..].iter().filter(|p| p.text.contains("失联")).collect();
+    assert_eq!(lost.len(), 1, "only the agent whose machine is up: {:?}", e.state.pending);
+    e.check_status(now + Duration::minutes(7), &none);
+    assert_eq!(
+        e.state.pending[before..].iter().filter(|p| p.text.contains("失联")).count(),
+        2,
+        "the other one, once its machine is back"
+    );
+    e.report(&token, &report(&node, json!({})), now + Duration::minutes(8)).unwrap();
+    assert!(e.state.pending.last().unwrap().text.contains("恢复上报"));
 }

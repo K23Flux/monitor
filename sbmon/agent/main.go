@@ -29,7 +29,7 @@ import (
 )
 
 const (
-	version        = "0.3.2"
+	version        = "0.4.0"
 	configFile     = "/etc/sb-agent/config.json"
 	stateFile      = "/var/lib/sb-agent/state.json"
 	singBoxConfig  = "/etc/sing-box/config.json"
@@ -47,6 +47,10 @@ type Config struct {
 	ConfigPath        string `json:"config_path"`
 	ServiceName       string `json:"service_name"`
 	IntervalSeconds   int    `json:"interval_seconds"`
+	// LogFile is where sing-box writes its log on machines without journald
+	// (Alpine / OpenRC, where supervise-daemon redirects it to a file). Empty
+	// means the systemd journal of ServiceName.
+	LogFile string `json:"log_file,omitempty"`
 }
 
 type Inbound struct {
@@ -209,6 +213,7 @@ func initConfig(args []string) error {
 	token := flags.String("token", "", "one-time registration token")
 	name := flags.String("name", "", "node display name")
 	service := flags.String("service", defaultService, "sing-box systemd service")
+	logFile := flags.String("log-file", "", "read sing-box's log from this file instead of the journal")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -233,6 +238,7 @@ func initConfig(args []string) error {
 		ConfigPath:        singBoxConfig,
 		ServiceName:       strings.TrimSpace(*service),
 		IntervalSeconds:   5,
+		LogFile:           strings.TrimSpace(*logFile),
 	}
 	if cfg.ServiceName == "" {
 		cfg.ServiceName = defaultService
@@ -397,14 +403,24 @@ func collectAndReport(cfg *Config, state *AgentState) error {
 	}
 
 	events := []string{}
-	if state.LastLogUnix == 0 || now.Unix()-state.LastLogUnix >= 30 {
-		events = collectWarningLogs(cfg.ServiceName, state.LastLogUnix)
+	var activity []InboundActivity
+	if cfg.LogFile != "" {
+		// No journal: read what sing-box appended to its log file since the
+		// last report, once, for both the warnings and the connections.
+		lines := logTail.read(cfg.LogFile)
+		events = warningLines(lines)
+		activity = collectInboundActivityFromLines(lines, inbounds, now.Unix())
+		state.LastActivityUnix = now.Unix()
+	} else {
+		if state.LastLogUnix == 0 || now.Unix()-state.LastLogUnix >= 30 {
+			events = collectWarningLogs(cfg.ServiceName, state.LastLogUnix)
+		}
+		// Inbound connection activity is scanned every report so per-user online
+		// detection reacts within one interval instead of waiting on the 30s log cycle.
+		var activityUnix int64
+		activity, activityUnix = collectInboundActivity(cfg.ServiceName, state.LastActivityUnix, inbounds)
+		state.LastActivityUnix = activityUnix
 	}
-
-	// Inbound connection activity is scanned every report so per-user online
-	// detection reacts within one interval instead of waiting on the 30s log cycle.
-	activity, activityUnix := collectInboundActivity(cfg.ServiceName, state.LastActivityUnix, inbounds)
-	state.LastActivityUnix = activityUnix
 
 	hostname, _ := os.Hostname()
 	report := Report{
@@ -666,6 +682,9 @@ func serviceRunning(service string) bool {
 	if exec.Command("systemctl", "is-active", "--quiet", service).Run() == nil {
 		return true
 	}
+	if exec.Command("rc-service", service, "status").Run() == nil {
+		return true
+	}
 	return exec.Command("pgrep", "-x", "sing-box").Run() == nil
 }
 
@@ -695,9 +714,14 @@ func collectWarningLogs(service string, sinceUnix int64) []string {
 	if err != nil {
 		return nil
 	}
-	lines := strings.Split(string(output), "\n")
-	result := make([]string, 0, len(lines))
+	return warningLines(strings.Split(string(output), "\n"))
+}
+
+// warningLines keeps the WARN and worse lines, cut to 2000 bytes each.
+func warningLines(lines []string) []string {
+	result := make([]string, 0)
 	for _, line := range lines {
+		line = ansiRe.ReplaceAllString(line, "")
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "-- No entries --") {
 			continue
@@ -1073,6 +1097,12 @@ func collectInboundActivity(service string, sinceUnix int64, inbounds []Inbound)
 		}
 	}
 
+	return t.summarize(tags, portOf, muxOf, established, procOK, now), nextSince
+}
+
+// summarize turns the accumulated activity and the open sockets into the
+// per-tag report entries.
+func (t *connTracker) summarize(tags map[string]bool, portOf map[string]int, muxOf map[string]bool, established map[int]map[string]bool, procOK bool, now int64) []InboundActivity {
 	live := t.liveCounts(established, portOf, now)
 	result := make([]InboundActivity, 0, len(t.acc)+len(live))
 	for tag := range tags {
@@ -1096,7 +1126,123 @@ func collectInboundActivity(service string, sinceUnix int64, inbounds []Inbound)
 		})
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Tag < result[j].Tag })
-	return result, nextSince
+	return result
+}
+
+// watchedInbounds indexes the tagged inbounds for activity tracking.
+func watchedInbounds(inbounds []Inbound) (tags map[string]bool, portOf map[string]int, muxOf map[string]bool, ports map[int]bool) {
+	tags, portOf, muxOf, ports = map[string]bool{}, map[string]int{}, map[string]bool{}, map[int]bool{}
+	for _, inbound := range inbounds {
+		if inbound.Tag != "" {
+			tags[inbound.Tag] = true
+			portOf[inbound.Tag] = inbound.Port
+			muxOf[inbound.Tag] = inbound.Mux
+			ports[inbound.Port] = true
+		}
+	}
+	return
+}
+
+// collectInboundActivityFromLines is collectInboundActivity for a log file:
+// the lines are what sing-box appended since the last report.
+func collectInboundActivityFromLines(lines []string, inbounds []Inbound, now int64) []InboundActivity {
+	tags, portOf, muxOf, ports := watchedInbounds(inbounds)
+	if len(tags) == 0 {
+		return nil
+	}
+	t := tracker
+	for _, raw := range lines {
+		if ts, id, tag, kind, dir, peer, ok := parseLogFileLine(raw, now); ok && tags[tag] {
+			t.handleLine(ts, id, tag, kind, dir, peer, true)
+		}
+	}
+	established, procOK := readEstablished(ports)
+	return t.summarize(tags, portOf, muxOf, established, procOK, now)
+}
+
+// singboxFileStampRe is sing-box's own timestamp ("+0800 2006-01-02 15:04:05")
+// at the start of a line it writes to a file.
+var singboxFileStampRe = regexp.MustCompile(`^([+-]\d{4} \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) `)
+
+// parseLogFileLine reads one line of sing-box's own log output. Without
+// log.timestamp a line carries no time and is taken as written just now.
+func parseLogFileLine(raw string, now int64) (ts int64, id, tag, kind, dir, peer string, ok bool) {
+	line := strings.TrimSpace(ansiRe.ReplaceAllString(raw, ""))
+	ts = now
+	if m := singboxFileStampRe.FindStringSubmatch(line); m != nil {
+		if parsed, err := time.Parse("-0700 2006-01-02 15:04:05", m[1]); err == nil {
+			ts = parsed.Unix()
+		}
+		line = line[len(m[0]):]
+	}
+	if !strings.HasPrefix(line, "INFO") {
+		return
+	}
+	match := inboundConnRe.FindStringSubmatch(line)
+	if match == nil {
+		return
+	}
+	return ts, match[1], match[2], strings.TrimSpace(match[3]), match[4], match[5], true
+}
+
+// fileTail follows a log file across reports: it starts at the end (nothing
+// from before the agent started is replayed), starts over when the file is
+// replaced or truncated, and never splits a line still being written.
+type fileTail struct {
+	path   string
+	offset int64
+	ino    uint64
+	opened bool
+}
+
+var logTail = &fileTail{}
+
+const maxTailRead = 4 << 20
+
+func (f *fileTail) read(path string) []string {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil
+	}
+	var ino uint64
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		ino = st.Ino
+	}
+	size := info.Size()
+	if !f.opened || f.path != path {
+		f.path, f.offset, f.ino, f.opened = path, size, ino, true
+		return nil
+	}
+	if ino != f.ino || size < f.offset {
+		f.offset, f.ino = 0, ino
+	}
+	if size == f.offset {
+		return nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+	length := size - f.offset
+	if length > maxTailRead {
+		// A burst larger than this is skipped to its last part rather than
+		// read whole into a small machine's memory.
+		f.offset = size - maxTailRead
+		length = maxTailRead
+	}
+	buf := make([]byte, length)
+	n, err := file.ReadAt(buf, f.offset)
+	if n <= 0 {
+		return nil
+	}
+	buf = buf[:n]
+	end := bytes.LastIndexByte(buf, '\n')
+	if end < 0 {
+		return nil
+	}
+	f.offset += int64(end + 1)
+	return strings.Split(string(buf[:end]), "\n")
 }
 
 func postJSON(endpoint, token string, input any, output any) error {
