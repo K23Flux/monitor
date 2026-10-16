@@ -14,7 +14,7 @@ K23Flux/monitor 在上游 [monitor-probe/monitor](https://github.com/monitor-pro
 - sing-box 页里这台机器显示「随探针安装」，名字跟着「节点」页走；在「节点」页删掉机器，sing-box 记录一起删。
 - 已经装过探针的机器，**再跑一次同样的命令**（或 `--upgrade`）就会补装 / 升级 sb-agent。
 - 不想装就在命令末尾加 `--no-singbox`；`--uninstall` 会一起卸载 sb-agent（保留 `/etc/sb-agent` 里的配置）。
-- 只支持 systemd 的机器（sb-agent 读 journal）；OpenRC 的机器只装 monitor-agent。
+- systemd 的机器从 journal 读 sing-box 日志；OpenRC（Alpine）的机器从 `/etc/init.d/sing-box` 里 `output_log` 指向的文件读（默认 `/var/log/sing-box.log`），sb-agent 以 `GOMEMLIMIT=16MiB` 跑在 OpenRC 服务 `sb-agent` 下；没有 bash 的 Alpine 会先 `apk add bash`。
 - sb-agent 装失败不影响 monitor-agent，安装命令会提示重跑。
 
 单独装 sing-box 监控（不装整机探针）仍可以在「sing-box」页点「单独安装」生成一次性命令。原来从 Komari 迁过来的 sb-agent 也是这种，可以在 sing-box 页用「关联到节点」把它和整机探针的节点对上。

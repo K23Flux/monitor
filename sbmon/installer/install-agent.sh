@@ -67,7 +67,18 @@ if [[ ! -f "$CONFIG_PATH" ]]; then
   exit 1
 fi
 
-for command_name in curl systemctl sha256sum install; do
+# systemd reads sing-box's log from the journal; OpenRC (Alpine) has no journal,
+# so sb-agent follows the file supervise-daemon writes sing-box's output to.
+if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+  INIT=systemd
+elif command -v rc-service >/dev/null 2>&1; then
+  INIT=openrc
+else
+  echo "需要 systemd 或 OpenRC。" >&2
+  exit 1
+fi
+
+for command_name in curl sha256sum install; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     echo "缺少必要命令：$command_name" >&2
     exit 1
@@ -79,6 +90,8 @@ if ! command -v nft >/dev/null 2>&1; then
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update
     DEBIAN_FRONTEND=noninteractive apt-get install -y nftables
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache nftables
   elif command -v dnf >/dev/null 2>&1; then
     dnf install -y nftables
   elif command -v yum >/dev/null 2>&1; then
@@ -88,6 +101,24 @@ if ! command -v nft >/dev/null 2>&1; then
     exit 1
   fi
 fi
+
+LOG_FILE=""
+if [[ "$INIT" == openrc ]]; then
+  # The file sing-box's own init script sends its output to.
+  LOG_FILE="$(sed -n -e 's/^[[:space:]]*output_log=["'\'']\{0,1\}\([^"'\'' ]*\).*/\1/p' /etc/init.d/sing-box 2>/dev/null | head -n 1)"
+  LOG_FILE="${LOG_FILE:-/var/log/sing-box.log}"
+  echo "OpenRC：从 ${LOG_FILE} 读取 sing-box 日志"
+fi
+
+stop_agent() {
+  if [[ "$INIT" == systemd ]]; then systemctl stop sb-agent.service; else rc-service sb-agent stop >/dev/null 2>&1 || true; fi
+}
+restart_agent() {
+  if [[ "$INIT" == systemd ]]; then systemctl restart sb-agent.service; else rc-service sb-agent restart; fi
+}
+agent_running() {
+  if [[ "$INIT" == systemd ]]; then systemctl is-active --quiet sb-agent.service; else rc-service sb-agent status >/dev/null 2>&1 && pidof sb-agent >/dev/null; fi
+}
 
 machine_arch="$(uname -m)"
 case "$machine_arch" in
@@ -122,58 +153,88 @@ printf '%s\n' "$expected_line" > "${temporary_dir}/one-checksum.txt"
 
 if [[ "$UPDATE" == true ]]; then
   cp -p /usr/local/bin/sb-agent "${temporary_dir}/previous-agent"
-  systemctl stop sb-agent.service
+  stop_agent
 fi
 install -m 0755 "${temporary_dir}/${binary_name}" /usr/local/bin/sb-agent
 mkdir -p /etc/sb-agent /var/lib/sb-agent
 chmod 0700 /etc/sb-agent /var/lib/sb-agent
 
 if [[ "$UPDATE" != true ]]; then
-/usr/local/bin/sb-agent init \
-  --server "$SERVER" \
-  --token "$TOKEN" \
-  --name "$NAME"
+  init_args=(--server "$SERVER" --token "$TOKEN" --name "$NAME")
+  [[ -z "$LOG_FILE" ]] || init_args+=(--log-file "$LOG_FILE")
+  /usr/local/bin/sb-agent init "${init_args[@]}"
 fi
 
-unit_file="$(mktemp)"
-printf '%s\n' \
-  '[Unit]' \
-  'Description=Sing-box Monitor Agent' \
-  'After=network-online.target sing-box.service' \
-  'Wants=network-online.target' \
-  '' \
-  '[Service]' \
-  'Type=simple' \
-  'ExecStart=/usr/local/bin/sb-agent run' \
-  'Restart=always' \
-  'RestartSec=5' \
-  'NoNewPrivileges=true' \
-  'UMask=0077' \
-  '' \
-  '[Install]' \
-  'WantedBy=multi-user.target' > "$unit_file"
-install -m 0644 "$unit_file" /etc/systemd/system/sb-agent.service
-rm -f "$unit_file"
+if [[ "$INIT" == systemd ]]; then
+  unit_file="$(mktemp)"
+  printf '%s\n' \
+    '[Unit]' \
+    'Description=Sing-box Monitor Agent' \
+    'After=network-online.target sing-box.service' \
+    'Wants=network-online.target' \
+    '' \
+    '[Service]' \
+    'Type=simple' \
+    'ExecStart=/usr/local/bin/sb-agent run' \
+    'Environment=GOMEMLIMIT=32MiB' \
+    'Restart=always' \
+    'RestartSec=5' \
+    'NoNewPrivileges=true' \
+    'UMask=0077' \
+    '' \
+    '[Install]' \
+    'WantedBy=multi-user.target' > "$unit_file"
+  install -m 0644 "$unit_file" /etc/systemd/system/sb-agent.service
+  rm -f "$unit_file"
+  systemctl daemon-reload
+  systemctl enable sb-agent.service >/dev/null 2>&1
+  systemctl restart sb-agent.service
+else
+  # GOMEMLIMIT keeps the Go heap small on the tiny containers OpenRC usually
+  # means (Alpine LXC with 128 MB).
+  cat > /etc/init.d/sb-agent <<'RC'
+#!/sbin/openrc-run
+description="Sing-box Monitor Agent"
+command="/usr/local/bin/sb-agent"
+command_args="run"
+supervisor="supervise-daemon"
+respawn_delay=5
+output_log="/var/log/sb-agent.log"
+error_log="/var/log/sb-agent.log"
+export GOMEMLIMIT=16MiB
 
-systemctl daemon-reload
-systemctl enable --now sb-agent.service
-sleep 2
+depend() {
+	need net
+	after sing-box
+}
+RC
+  chmod 0755 /etc/init.d/sb-agent
+  rc-update add sb-agent default >/dev/null
+  rc-service sb-agent restart >/dev/null
+fi
+sleep 3
+
+if [[ "$INIT" == systemd ]]; then
+  status_hint="systemctl status sb-agent"; log_hint="journalctl -u sb-agent -f"; fail_hint="journalctl -u sb-agent -n 100 --no-pager"
+else
+  status_hint="rc-service sb-agent status"; log_hint="tail -f /var/log/sb-agent.log"; fail_hint="tail -n 100 /var/log/sb-agent.log"
+fi
 
 echo ""
-if systemctl is-active --quiet sb-agent.service; then
+if agent_running; then
   echo "✓ sb-agent 安装完成并已启动"
   echo "✓ 节点名称：$NAME"
   echo "✓ 配置文件：$CONFIG_PATH"
   echo ""
-  echo "查看状态：systemctl status sb-agent"
-  echo "查看日志：journalctl -u sb-agent -f"
+  echo "查看状态：$status_hint"
+  echo "查看日志：$log_hint"
 else
   if [[ "$UPDATE" == true ]]; then
     install -m 0755 "${temporary_dir}/previous-agent" /usr/local/bin/sb-agent
-    systemctl restart sb-agent.service
+    restart_agent || true
     echo "升级未通过启动检查，已恢复旧 Agent 二进制。" >&2
   fi
   echo "sb-agent 启动失败，请运行以下命令查看原因：" >&2
-  echo "journalctl -u sb-agent -n 100 --no-pager" >&2
+  echo "$fail_hint" >&2
   exit 1
 fi

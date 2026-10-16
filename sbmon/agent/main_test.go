@@ -323,3 +323,53 @@ func TestParseJournalLineWithSingboxTimestamp(t *testing.T) {
 		t.Fatalf("plain line no longer parsed")
 	}
 }
+
+func TestParseLogFileLine(t *testing.T) {
+	ts, id, tag, kind, dir, peer, ok := parseLogFileLine("+0800 2026-10-16 13:00:05 INFO [123 0ms] inbound/hysteria2[hy2-in]: [WTY] inbound connection to www.example.org:443", 1)
+	if !ok || id != "123" || tag != "hy2-in" || kind != "" || dir != "to" || peer != "www.example.org:443" {
+		t.Fatalf("got %v %q %q %q %q %q", ok, id, tag, kind, dir, peer)
+	}
+	if want := time.Date(2026, 10, 16, 5, 0, 5, 0, time.UTC).Unix(); ts != want {
+		t.Fatalf("time %d, want %d", ts, want)
+	}
+	// Without log.timestamp the line is dated by the reader.
+	if ts, _, _, _, _, _, ok := parseLogFileLine("\x1b[36mINFO\x1b[0m [7 0ms] inbound/shadowsocks[ss]: inbound connection from 1.2.3.4:5", 42); !ok || ts != 42 {
+		t.Fatalf("untimed line: %v %d", ok, ts)
+	}
+	if _, _, _, _, _, _, ok := parseLogFileLine("+0800 2026-10-16 13:00:05 WARN something", 1); ok {
+		t.Fatal("a warning is not a connection")
+	}
+}
+
+func TestFileTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sing-box.log")
+	if err := os.WriteFile(path, []byte("old line\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tail := &fileTail{}
+	if got := tail.read(path); got != nil {
+		t.Fatalf("first read replays nothing, got %q", got)
+	}
+	appendTo := func(s string) {
+		f, _ := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+		f.WriteString(s)
+		f.Close()
+	}
+	appendTo("a\nb\npartial")
+	if got := tail.read(path); strings.Join(got, ",") != "a,b" {
+		t.Fatalf("got %q", got)
+	}
+	appendTo(" done\n")
+	if got := tail.read(path); strings.Join(got, ",") != "partial done" {
+		t.Fatalf("a line is read once complete, got %q", got)
+	}
+	// Rotated: a new, shorter file is read from its start.
+	os.Remove(path)
+	os.WriteFile(path, []byte("fresh\n"), 0o600)
+	if got := tail.read(path); strings.Join(got, ",") != "fresh" {
+		t.Fatalf("after rotation got %q", got)
+	}
+	if got := warningLines([]string{"INFO ok", "\x1b[33mWARN\x1b[0m bad", "", "ERROR worse"}); len(got) != 2 {
+		t.Fatalf("warnings %q", got)
+	}
+}

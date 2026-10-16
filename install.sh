@@ -76,9 +76,11 @@ if [ -n "$UNINSTALL" ]; then
 	echo "monitor-agent uninstalled"
 	# The sing-box monitor installed with it. Its config and counters stay in
 	# /etc/sb-agent and /var/lib/sb-agent, as its own uninstaller leaves them.
-	if [ -f /etc/systemd/system/sb-agent.service ] || [ -f /usr/local/bin/sb-agent ]; then
+	if [ -f /etc/systemd/system/sb-agent.service ] || [ -f /etc/init.d/sb-agent ] || [ -f /usr/local/bin/sb-agent ]; then
 		systemctl disable --now sb-agent 2>/dev/null || true
-		rm -f /etc/systemd/system/sb-agent.service /usr/local/bin/sb-agent
+		rc-service sb-agent stop 2>/dev/null || true
+		rc-update del sb-agent default >/dev/null 2>&1 || true
+		rm -f /etc/systemd/system/sb-agent.service /etc/init.d/sb-agent /usr/local/bin/sb-agent
 		systemctl daemon-reload 2>/dev/null || true
 		echo "sb-agent uninstalled (its config stays in /etc/sb-agent)"
 	fi
@@ -231,8 +233,13 @@ fi
 singbox_monitor() {
 	[ -z "$NO_SINGBOX" ] || return 0
 	[ -f "$SB_CONFIG" ] || return 0
-	if [ "$INIT" != systemd ] || ! command -v bash >/dev/null || ! command -v journalctl >/dev/null; then
-		echo "sing-box found, but its monitor needs systemd, journalctl and bash; skipped" >&2
+	# Its installer is a bash script; Alpine ships without bash.
+	if ! command -v bash >/dev/null && command -v apk >/dev/null; then
+		echo "installing bash for the sing-box monitor's installer"
+		apk add --no-cache bash >/dev/null || true
+	fi
+	if ! command -v bash >/dev/null || { [ "$INIT" = systemd ] && ! command -v journalctl >/dev/null; }; then
+		echo "sing-box found, but its monitor needs bash (and journalctl under systemd); skipped" >&2
 		return 0
 	fi
 	echo "sing-box found: installing the sing-box monitor (sb-agent)"
@@ -458,6 +465,7 @@ RC
 	pidof monitor-agent >/dev/null || not_started "$LOG_FILE"
 	rm -f "$BIN.old"
 	echo "monitor-agent installed; follow it with: tail -f $LOG_FILE"
+	singbox_monitor
 	exit 0
 fi
 
