@@ -28,12 +28,22 @@ sing-box 配置里开了只监听本机的 `experimental.clash_api`（如 `"exte
 - sing-box 页每台服务器下面列出各用户今天和本月的流量，顶部有所有服务器的合计。对不上用户的连接记在「未识别」下。
 - 只用回环地址上的 clash_api，secret 不会离开本机。没开 clash_api 的机器照旧按日志和 `/proc/net/tcp` 判断。
 
+## 每个用户的连接日志
+
+sb-agent 0.6.0 起每次上报带上这段时间的连接明细（时间、入站 tag、用户、来源、目标、tcp / udp / mux、是否测速探测），一次最多 3000 条，多出的只报条数。用户取自日志里的 `[用户]`；入站只有一个用户、日志没写用户名时记成这个用户。不需要 clash_api，日志级别是 `info` 即可。
+
+- hub 存在数据目录 `sbmonitor/userlog/<节点>/<日期>.jsonl`，按「统计时区」分天，保留天数在「连接监控 → 监控设置 → 连接日志保留天数」（默认 7，1–90）。删节点时一起删。
+- 后台 sing-box 页的「用户」卡片、各入站下的用户名、各服务器下按用户的流量都能点开日志；连接监控页每个监控用户旁有「连接日志」按钮。弹窗里可以换日期、服务器、用户（含「全部」「未识别」），搜目标或来源，按目标汇总；今天的记录每 10 秒刷新。用户名不分大小写（`ZOE` 和 `zoe` 算一个人）。
+- 接口：`GET /api/sbmonitor/v1/admin/userlog?user=&date=&node_id=&q=&probes=1`（`user=?` 查未识别的）。
+- 升级前的连接不会补，日志从各机 sb-agent 升到 0.6.0 那一刻开始。
+
 ## 组成
 
 | 位置 | 说明 |
 | --- | --- |
 | `src/sbmon/engine.rs` | 状态机：注册、上报、流量记账、上线 / 下线判定、通知文本。纯逻辑，不碰文件和网络 |
 | `src/sbmon/mod.rs` | 文件读写、Telegram 发送、定时任务、HTTP 接口 |
+| `src/sbmon/userlog.rs` | 连接日志：按天写入、按用户查询、过期清理 |
 | `src/sbmon/tests.rs` | 从插件的 `tests/plugin.test.js` 移植的用例 |
 | `web-admin/src/components/SingBox.tsx` | 后台的两个页面 |
 | `sbmon/agent/` | sb-agent（Go），和插件 0.3.2 的探针一字不差 |

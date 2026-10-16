@@ -12,6 +12,7 @@
 //! unchanged. See `engine` for the state machine.
 
 pub mod engine;
+pub mod userlog;
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -38,9 +39,9 @@ use engine::{Config, Engine, State as SbState};
 pub const API: &str = "/api/sbmonitor/v1";
 /// Settings live in the hub's `setting` table under this prefix.
 const PREFIX: &str = "sbmon_";
-/// The plugin allowed reports up to 1 MiB; a busy watched inbound with many
-/// visits since the last report can approach that.
-pub const MAX_REPORT: usize = 1024 * 1024;
+/// The plugin allowed reports up to 1 MiB; sb-agent 0.6.0 adds up to 3000
+/// connections for the user log on top of the visits, so allow twice that.
+pub const MAX_REPORT: usize = 2 * 1024 * 1024;
 const INSTALLER: &str = include_str!("../../sbmon/installer/install-agent.sh");
 const UNINSTALLER: &str = include_str!("../../sbmon/installer/uninstall-agent.sh");
 
@@ -129,6 +130,18 @@ impl Sbmon {
     fn history_file(&self, node_id: &str, day: &str) -> PathBuf {
         self.dir.join("history").join(node_id).join(format!("{day}.jsonl"))
     }
+
+    fn userlog_dir(&self) -> PathBuf {
+        self.dir.join("userlog")
+    }
+
+    /// Removes a node's minute history and connection log.
+    fn remove_node_files(&self, node_id: &str) {
+        if node_id.len() == 32 && node_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let _ = std::fs::remove_dir_all(self.dir.join("history").join(node_id));
+            let _ = std::fs::remove_dir_all(self.userlog_dir().join(node_id));
+        }
+    }
 }
 
 fn reload_config(app: &App) {
@@ -192,6 +205,21 @@ fn hub_offline(app: &App) -> std::collections::HashSet<i64> {
         .unwrap_or_default()
 }
 
+/// Appends several lines in one write.
+fn append_lines(file: &Path, lines: &[String]) -> Result<()> {
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut text = String::with_capacity(lines.iter().map(|l| l.len() + 1).sum());
+    for line in lines {
+        text.push_str(line);
+        text.push('\n');
+    }
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(file)?;
+    f.write_all(text.as_bytes())?;
+    Ok(())
+}
+
 fn append_line(file: &Path, line: &str) -> Result<()> {
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent)?;
@@ -202,14 +230,16 @@ fn append_line(file: &Path, line: &str) -> Result<()> {
 }
 
 fn cleanup_history(sb: &Sbmon, now: chrono::DateTime<Utc>) {
-    let keep = {
+    let (keep, userlog_cutoff) = {
         let mut engine = sb.lock();
         engine.prune_daily(now);
         sb.persist(&mut engine);
-        engine.config.history_days
+        let days = engine.config.userlog_days as i64;
+        (engine.config.history_days, engine.config.date_key(now - chrono::Duration::days(days.max(1) - 1)))
     };
     let cutoff = (now - chrono::Duration::days(keep as i64)).format("%Y-%m-%d").to_string();
     let known: std::collections::HashSet<String> = sb.lock().state.nodes.keys().cloned().collect();
+    userlog::cleanup(&sb.userlog_dir(), &known, &userlog_cutoff);
     let Ok(nodes) = std::fs::read_dir(sb.dir.join("history")) else { return };
     for node in nodes.flatten() {
         // A node deleted while the hub was down, or one that never came across
@@ -383,29 +413,38 @@ fn sync_hub(app: &App) {
         gone
     };
     for id in gone {
-        if id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
-            let _ = std::fs::remove_dir_all(sb.dir.join("history").join(&id));
-        }
+        sb.remove_node_files(&id);
     }
 }
 
 async fn agent_report(State(app): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
     let Some(body) = json_body(&body) else { return agent_fail(400, "请求内容不是有效 JSON") };
     let sb = &app.sbmon;
-    let (result, queued) = {
+    let now = Utc::now();
+    let (result, queued, config) = {
         let mut engine = sb.lock();
         let before = engine.notable;
-        let result = engine.report(&bearer(&headers), &body, Utc::now());
+        let result = engine.report(&bearer(&headers), &body, now);
         let queued = engine.notable != before;
         if queued {
             sb.persist(&mut engine);
         } else if result.is_ok() {
             sb.dirty.store(true, Ordering::Release);
         }
-        (result, queued)
+        (result, queued, engine.config.clone())
     };
     if queued {
         sb.wake.notify_one();
+    }
+    if result.is_ok() {
+        // Authenticated, so the node id is one of ours (32 hex characters).
+        let node_id = body.get("node_id").and_then(Value::as_str).unwrap_or_default();
+        for (day, lines) in userlog::lines_from_report(&body, &config, now) {
+            let file = sb.userlog_dir().join(node_id).join(format!("{day}.jsonl"));
+            if let Err(e) = append_lines(&file, &lines) {
+                warn!("writing the sing-box connection log failed: {e:#}");
+            }
+        }
     }
     match result {
         Ok(value) => agent_json(200, value),
@@ -548,11 +587,8 @@ async fn set_watch(_: Admin, State(app): State<Shared>, Json(body): Json<WatchBo
 
 async fn delete_node(_: Admin, State(app): State<Shared>, Json(body): Json<NodeBody>) -> Response {
     let result = edit(&app, |e| e.delete_node(&body.node_id));
-    if result.status().is_success()
-        && body.node_id.len() == 32
-        && body.node_id.bytes().all(|b| b.is_ascii_hexdigit())
-    {
-        let _ = std::fs::remove_dir_all(app.sbmon.dir.join("history").join(&body.node_id));
+    if result.status().is_success() {
+        app.sbmon.remove_node_files(&body.node_id);
     }
     result
 }
@@ -597,6 +633,56 @@ async fn history(_: Admin, State(app): State<Shared>, Query(q): Query<HistoryQue
     private(json!({"ok": true, "node_id": q.node_id, "date": day, "points": points}))
 }
 
+#[derive(Deserialize)]
+struct UserlogQuery {
+    #[serde(default)]
+    user: String,
+    #[serde(default)]
+    date: String,
+    #[serde(default)]
+    node_id: String,
+    #[serde(default)]
+    q: String,
+    #[serde(default)]
+    probes: String,
+}
+
+/// One user's connections on one day, across every node or one.
+async fn userlog(_: Admin, State(app): State<Shared>, Query(q): Query<UserlogQuery>) -> Response {
+    let sb = &app.sbmon;
+    let (day, nodes) = {
+        let engine = sb.lock();
+        let day = if q.date.is_empty() { engine.config.date_key(Utc::now()) } else { q.date.clone() };
+        let nodes: Vec<(String, String)> = engine
+            .state
+            .nodes
+            .values()
+            .filter(|n| q.node_id.is_empty() || n.id == q.node_id)
+            .map(|n| (n.id.clone(), n.name.clone()))
+            .collect();
+        (day, nodes)
+    };
+    if !q.node_id.is_empty() && nodes.is_empty() {
+        return answer(StatusCode::NOT_FOUND, "节点不存在");
+    }
+    if day.len() != 10 || chrono::NaiveDate::parse_from_str(&day, "%Y-%m-%d").is_err() {
+        return refuse("日期格式错误");
+    }
+    let filter = userlog::Filter {
+        user: q.user.trim().to_lowercase(),
+        search: q.q.trim().to_lowercase(),
+        probes: matches!(q.probes.as_str(), "1" | "true"),
+    };
+    let dir = sb.userlog_dir();
+    match tokio::task::spawn_blocking(move || userlog::query(&dir, &nodes, &day, &filter)).await {
+        Ok(value) => private(value),
+        Err(e) => {
+            warn!("reading the sing-box connection log failed: {e}");
+            answer(StatusCode::INTERNAL_SERVER_ERROR, "读取连接日志失败")
+        }
+    }
+}
+
 /// The stored settings as the form edits them. The bot token is never sent
 /// back; an empty token in a save keeps the stored one.
 async fn get_config(_: Admin, State(app): State<Shared>) -> Response {
@@ -627,6 +713,7 @@ fn config_error(key: &str, value: &str) -> Option<String> {
         "timezone_offset" => number(-12.0, 14.0, "统计时区"),
         "offline_seconds" => number(15.0, 3600.0, "节点离线判定秒数"),
         "history_days" => number(1.0, 365.0, "历史保留天数"),
+        "userlog_days" => number(1.0, 90.0, "连接日志保留天数"),
         "session_idle_seconds" => number(30.0, 86400.0, "空闲判定秒数"),
         "offline_grace_seconds" => number(10.0, 3600.0, "下线确认秒数"),
         "online_confirm_seconds" => number(0.0, 600.0, "上线确认秒数"),
@@ -691,6 +778,7 @@ pub fn admin_routes() -> Router<Shared> {
         .route(&format!("{API}/admin/state"), get(admin_state))
         .route(&format!("{API}/admin/watch"), get(admin_watch))
         .route(&format!("{API}/admin/history"), get(history))
+        .route(&format!("{API}/admin/userlog"), get(userlog))
         .route(&format!("{API}/admin/config"), get(get_config).put(save_config))
         .route(&format!("{API}/admin/config/token"), axum::routing::delete(clear_token))
         .route(&format!("{API}/admin/registration"), post(create_registration))
