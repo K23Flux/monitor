@@ -306,6 +306,11 @@ pub struct Node {
     pub last_totals: BTreeMap<String, Totals>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_activity: Option<Value>,
+    /// The hub node this sb-agent was installed with, when it came in through the
+    /// hub's own agent install (`install.sh` registers it with the node token).
+    /// Such a node takes its name from the hub node and goes when that node does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hub_node_id: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -1111,6 +1116,7 @@ impl Engine {
             "singbox": node.singbox,
             "ports": ports,
             "lastActivity": node.last_activity,
+            "hubNodeId": node.hub_node_id,
         })
     }
 
@@ -1226,9 +1232,90 @@ impl Engine {
         Ok(json!({"ok": true, "token": token, "name": name, "expires_at": expires}))
     }
 
+    /// Registers the sb-agent installed alongside hub node `hub_id`. Run again for
+    /// the same hub node -- a reinstall, a rebuilt machine -- it keeps the sb
+    /// node and its history and issues a new agent token, so one machine never
+    /// shows up twice.
+    pub fn register_linked(
+        &mut self,
+        hub_id: i64,
+        hub_name: &str,
+        body: &Value,
+        now: DateTime<Utc>,
+    ) -> Value {
+        let field = |k: &str, max| clean_text(&text(body.get(k).unwrap_or(&Value::Null)), max);
+        let agent_token = random_hex(32);
+        let existing =
+            self.state.nodes.values().find(|n| n.hub_node_id == Some(hub_id)).map(|n| n.id.clone());
+        let node_id = existing.unwrap_or_else(|| random_hex(16));
+        let name =
+            Some(clean_name(hub_name)).filter(|n| !n.is_empty()).unwrap_or_else(|| format!("节点 {hub_id}"));
+        let node = self.state.nodes.entry(node_id.clone()).or_insert_with(|| Node {
+            id: node_id.clone(),
+            created_at: iso(now),
+            hub_node_id: Some(hub_id),
+            ..Default::default()
+        });
+        node.name = name.clone();
+        node.hostname = field("hostname", 120);
+        node.arch = field("arch", 30);
+        node.agent_version = field("agent_version", 30);
+        node.agent_token_hash = sha256_hex(&agent_token);
+        json!({"ok": true, "node_id": node_id, "agent_token": agent_token, "name": name})
+    }
+
+    /// Follows the hub's node list: a linked node takes its hub node's name, and
+    /// one whose hub node was deleted is deleted too. Returns whether anything changed.
+    pub fn sync_hub_nodes(&mut self, names: &BTreeMap<i64, String>) -> bool {
+        let mut changed = false;
+        let mut gone = Vec::new();
+        for node in self.state.nodes.values_mut() {
+            let Some(hub_id) = node.hub_node_id else { continue };
+            match names.get(&hub_id) {
+                None => gone.push(node.id.clone()),
+                Some(name) if !name.is_empty() && *name != node.name => {
+                    node.name = clean_name(name);
+                    changed = true;
+                }
+                Some(_) => {}
+            }
+        }
+        for id in gone {
+            let _ = self.delete_node(&id);
+            changed = true;
+        }
+        changed
+    }
+
+    /// Ties an sb node registered on its own (a one-time key, or carried over
+    /// from Komari) to hub node `hub`, or unties it with `None`. Afterwards it
+    /// behaves as if installed with the hub's agent.
+    pub fn link_node(&mut self, node_id: &str, hub: Option<(i64, &str)>) -> Result<(), &'static str> {
+        if !self.state.nodes.contains_key(node_id) {
+            return Err("节点不存在");
+        }
+        if let Some((hub_id, _)) = hub {
+            if self.state.nodes.values().any(|n| n.hub_node_id == Some(hub_id) && n.id != node_id) {
+                return Err("那个节点已经关联了另一台 sing-box");
+            }
+        }
+        let node = self.state.nodes.get_mut(node_id).expect("checked above");
+        node.hub_node_id = hub.map(|(id, _)| id);
+        if let Some((_, name)) = hub {
+            let name = clean_name(name);
+            if !name.is_empty() {
+                node.name = name;
+            }
+        }
+        Ok(())
+    }
+
     pub fn rename_node(&mut self, node_id: &str, name: &str) -> Result<(), &'static str> {
         let name = clean_name(name);
         let node = self.state.nodes.get_mut(node_id).ok_or("节点不存在")?;
+        if node.hub_node_id.is_some() {
+            return Err("这台机器随整机探针安装，名字跟着「节点」页走，在那里改");
+        }
         if name.is_empty() {
             return Err("节点名称不能为空");
         }

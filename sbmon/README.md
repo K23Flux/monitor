@@ -6,6 +6,19 @@ K23Flux/monitor 在上游 [monitor-probe/monitor](https://github.com/monitor-pro
 - **连接监控页**：按入站 tag 监控指定用户（如 `ss2022_alice=alice`），真正连上才算上线、连接全断才算下线，下线通知里列出这段时间访问的全部域名和时间。
 - **独立的 Telegram 机器人**：只发连接监控的上线 / 下线通知，和 hub「通知」页的节点掉线、流量、到期告警分开配置。
 
+## 安装：跟着整机探针一起装
+
+在后台「节点」页添加机器（单台或批量窗口都行），复制安装命令到机器上执行。`install.sh` 装完 monitor-agent 后，发现 `/etc/sing-box/config.json` 就从 hub 下载 sb-agent 一起装上，并用这台机器的节点 Token 注册，不用另外生成注册密钥：
+
+- sb-agent 自己读 sing-box 配置，**入站、端口、协议、用户名自动识别**，在「sing-box」页按机器列出；「连接监控」页的设置里会列出探测到的全部入站，点一下就加进监控。
+- sing-box 页里这台机器显示「随探针安装」，名字跟着「节点」页走；在「节点」页删掉机器，sing-box 记录一起删。
+- 已经装过探针的机器，**再跑一次同样的命令**（或 `--upgrade`）就会补装 / 升级 sb-agent。
+- 不想装就在命令末尾加 `--no-singbox`；`--uninstall` 会一起卸载 sb-agent（保留 `/etc/sb-agent` 里的配置）。
+- 只支持 systemd 的机器（sb-agent 读 journal）；OpenRC 的机器只装 monitor-agent。
+- sb-agent 装失败不影响 monitor-agent，安装命令会提示重跑。
+
+单独装 sing-box 监控（不装整机探针）仍可以在「sing-box」页点「单独安装」生成一次性命令。原来从 Komari 迁过来的 sb-agent 也是这种，可以在 sing-box 页用「关联到节点」把它和整机探针的节点对上。
+
 ## 组成
 
 | 位置 | 说明 |
@@ -35,7 +48,9 @@ K23Flux/monitor 在上游 [monitor-probe/monitor](https://github.com/monitor-pro
 
 给 sb-agent（公开，JSON 回复）：`POST agent/register`、`POST agent/report`、`GET install.sh`、`GET uninstall.sh`、`GET bin/{sb-agent-linux-amd64,sb-agent-linux-arm64,checksums.txt}`。
 
-后台（要登录，和 hub 其他接口一样拒绝跨站写请求）：`GET admin/state`、`GET admin/watch`、`GET admin/history?node_id=&date=`、`GET/PUT admin/config`、`DELETE admin/config/token`、`POST admin/registration`、`POST admin/node/{rename,alias,delete}`、`POST admin/telegram/test`。
+`agent/register` 的 `registration_token` 可以是后台生成的一次性密钥，也可以是 hub 节点的 Token（`install.sh` 用的就是这个），失败次数和 hub 自己的注册一起限流。
+
+后台（要登录，和 hub 其他接口一样拒绝跨站写请求）：`GET admin/state`、`GET admin/watch`、`GET admin/history?node_id=&date=`、`GET/PUT admin/config`、`DELETE admin/config/token`、`POST admin/registration`、`POST admin/node/{rename,alias,delete,link}`、`POST admin/telegram/test`。
 
 ## 编译
 
