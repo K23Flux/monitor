@@ -30,6 +30,7 @@ mod auth;
 mod db;
 mod frontend;
 mod notify;
+mod sbmon;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -86,6 +87,8 @@ pub struct App {
     /// asks rather than on a timer, so a hub nobody opens makes no outbound
     /// request; see `api::versions`.
     pub releases: Mutex<Releases>,
+    /// sing-box monitoring for the sb-agents on the landing nodes; see `sbmon`.
+    pub sbmon: sbmon::Sbmon,
 }
 
 #[derive(Default, Clone)]
@@ -98,7 +101,13 @@ pub struct Releases {
 }
 
 impl App {
-    fn new(db: Db, site: String, themes: PathBuf, notes: tokio::sync::mpsc::Sender<notify::Note>) -> Self {
+    fn new(
+        db: Db,
+        site: String,
+        themes: PathBuf,
+        notes: tokio::sync::mpsc::Sender<notify::Note>,
+        sbmon: sbmon::Sbmon,
+    ) -> Self {
         Self {
             db,
             agents: RwLock::default(),
@@ -114,13 +123,16 @@ impl App {
             themes,
             notes,
             releases: Mutex::default(),
+            sbmon,
         }
     }
 
     #[cfg(test)]
     pub fn for_test(db: Db) -> Self {
         // Nothing delivers in tests; `notify::send` drops into the closed channel.
-        Self::new(db, String::new(), PathBuf::from("themes"), tokio::sync::mpsc::channel(1).0)
+        let dir = std::env::temp_dir().join(format!("sbmon-test-{}", auth::random_token()));
+        let sbmon = sbmon::Sbmon::open(dir, &db).expect("sbmon state");
+        Self::new(db, String::new(), PathBuf::from("themes"), tokio::sync::mpsc::channel(1).0, sbmon)
     }
 
     pub fn public_page(&self) -> bool {
@@ -322,6 +334,8 @@ struct Args {
     database: String,
     site: String,
     themes: PathBuf,
+    /// Where the sing-box monitor keeps `state.json` and `history/`.
+    sbmon_dir: PathBuf,
     reset_password: bool,
 }
 
@@ -345,6 +359,7 @@ fn parse_args() -> Result<Args> {
     let mut database = "monitor.db".to_owned();
     let mut site = String::new();
     let mut themes = None;
+    let mut sbmon_dir = None;
     let mut reset_password = false;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -354,6 +369,7 @@ fn parse_args() -> Result<Args> {
             "--db" => database = value(),
             "--site" => site = value(),
             "--themes" => themes = Some(PathBuf::from(value())),
+            "--sbmon-dir" => sbmon_dir = Some(PathBuf::from(value())),
             "--reset-password" => reset_password = true,
             "-h" | "--help" => {
                 println!(
@@ -363,6 +379,8 @@ fn parse_args() -> Result<Args> {
                      --listen defaults to [::]:28080, one socket serving IPv6 and IPv4\n\
                      both; where the kernel has no dual-stack sockets it is 0.0.0.0:28080.\n\
                      --themes defaults to a themes/ directory beside the database.\n\
+                     --sbmon-dir defaults to a sbmonitor/ directory beside the database; it\n\
+                     holds the sing-box monitor's state.json and history/.\n\
                      --site is the https:// domain agents should use. Left out, the hub\n\
                      answers on whatever ip:port it is asked, and the panel builds install\n\
                      commands from the address in the browser's bar, which behind a TLS\n\
@@ -383,15 +401,17 @@ fn parse_args() -> Result<Args> {
     }
     let listen_defaulted = listen.is_none();
     let listen: SocketAddr = listen.unwrap_or_else(|| default_listen().to_owned()).parse()?;
-    let themes = themes.unwrap_or_else(|| {
-        std::path::Path::new(&database).parent().unwrap_or_else(|| std::path::Path::new(".")).join("themes")
-    });
+    let beside =
+        std::path::Path::new(&database).parent().unwrap_or_else(|| std::path::Path::new(".")).to_owned();
+    let themes = themes.unwrap_or_else(|| beside.join("themes"));
+    let sbmon_dir = sbmon_dir.unwrap_or_else(|| beside.join("sbmonitor"));
     Ok(Args {
         listen,
         listen_defaulted,
         database,
         site: site.trim_end_matches('/').to_owned(),
         themes,
+        sbmon_dir,
         reset_password,
     })
 }
@@ -459,7 +479,9 @@ async fn main() -> Result<()> {
         warn!("SQLite keeps its temporary files in its default directory: {e:#}");
     }
     let (notes, inbox) = tokio::sync::mpsc::channel(notify::QUEUE);
-    let app = Arc::new(App::new(Db::open(&args.database)?, args.site.clone(), args.themes, notes));
+    let db = Db::open(&args.database)?;
+    let sbmon = sbmon::Sbmon::open(args.sbmon_dir, &db)?;
+    let app = Arc::new(App::new(db, args.site.clone(), args.themes, notes, sbmon));
     let url = advertised_url(&args.site, args.listen);
     first_run(&app, &url)?;
     let port = args.listen.port();
@@ -520,6 +542,7 @@ async fn main() -> Result<()> {
     tokio::spawn(housekeeping(app.clone()));
     tokio::spawn(notify::deliver(app.clone(), inbox));
     tokio::spawn(notify::watch(app.clone()));
+    tokio::spawn(sbmon::run(app.clone()));
 
     let router = Router::new()
         // Read paths; the public page reaches these unauthenticated.
@@ -561,6 +584,7 @@ async fn main() -> Result<()> {
         .route("/api/db", get(api::db_stats))
         .route("/api/db/backup", get(api::db_backup))
         .route("/api/db/vacuum", post(api::db_vacuum))
+        .merge(sbmon::admin_routes())
         .fallback(frontend::serve)
         // Every body above is a JSON form of a few KiB at most. The ceiling also
         // bounds a theme's saved settings, which anonymous callers read back.
@@ -592,6 +616,8 @@ async fn main() -> Result<()> {
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
                 .with_state(app.clone()),
         )
+        // sb-agent, likewise outside the panel's layers: it parses JSON replies.
+        .merge(sbmon::agent_routes(app.clone()))
         .layer(tower_http::compression::CompressionLayer::new().compress_when(compressible()))
         .with_state(app);
 
@@ -892,12 +918,10 @@ mod tests {
     }
 
     fn app(site: &str) -> App {
-        App::new(
-            Db::open(":memory:").unwrap(),
-            site.into(),
-            PathBuf::from("themes"),
-            tokio::sync::mpsc::channel(1).0,
-        )
+        let db = Db::open(":memory:").unwrap();
+        let dir = std::env::temp_dir().join(format!("sbmon-test-{}", auth::random_token()));
+        let sbmon = sbmon::Sbmon::open(dir, &db).unwrap();
+        App::new(db, site.into(), PathBuf::from("themes"), tokio::sync::mpsc::channel(1).0, sbmon)
     }
 
     /// A request as a reverse proxy would forward it, or as it arrives with none
