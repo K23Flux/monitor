@@ -251,7 +251,7 @@ mod tests {
             "n1",
             &[
                 json!({"t": 10, "tag": "ss", "user": "ZOE", "src": "1.2.3.4:5", "dst": "video.example.org:443", "net": "tcp"}),
-                json!({"t": 20, "tag": "ss", "user": "LF", "dst": "lf.example:443", "net": "tcp"}),
+                json!({"t": 20, "tag": "ss", "user": "Kim", "dst": "kim.example:443", "net": "tcp"}),
                 json!({"t": 30, "tag": "ss", "user": "ZOE", "dst": "www.gstatic.com:443", "net": "tcp", "probe": true}),
                 json!({"t": 31, "dropped": 4}),
                 Value::String("not json".into()),
@@ -278,7 +278,7 @@ mod tests {
         // The users seen that day, one entry per name ignoring case.
         let users: Vec<&str> =
             r["users"].as_array().unwrap().iter().map(|u| u["user"].as_str().unwrap()).collect();
-        assert_eq!(users, ["", "LF", "ZOE"]);
+        assert_eq!(users, ["", "Kim", "ZOE"]);
 
         assert_eq!(query(&dir, &nodes, "2026-10-16", &filter("zoe", "", true))["total"], 3);
         assert_eq!(query(&dir, &nodes, "2026-10-16", &filter("zoe", "1.2.3", false))["total"], 1);

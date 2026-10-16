@@ -402,11 +402,11 @@ func TestClashUsageAttributesTrafficToUsers(t *testing.T) {
 	}
 	// The log is read at report time, after the connections were seen.
 	feed("INFO [5 0ms] inbound/hysteria2[hy2-in]: inbound connection from 203.0.113.9:4000")
-	feed("INFO [5 0ms] inbound/hysteria2[hy2-in]: [jasper] inbound connection to www.example.org:443")
+	feed("INFO [5 0ms] inbound/hysteria2[hy2-in]: [bob] inbound connection to www.example.org:443")
 	feed("INFO [6 0ms] inbound/hysteria2[hy2-in]: inbound packet connection from [2001:db8::1]:5000")
-	feed("INFO [6 0ms] inbound/hysteria2[hy2-in]: [LF] inbound packet connection to 1.1.1.1:53")
+	feed("INFO [6 0ms] inbound/hysteria2[hy2-in]: [Kim] inbound packet connection to 1.1.1.1:53")
 	got := w.usage(tr)
-	want := []UserTraffic{{"hy2-in", "", 7, 8}, {"hy2-in", "LF", 10, 20}, {"hy2-in", "jasper", 50, 500}}
+	want := []UserTraffic{{"hy2-in", "", 7, 8}, {"hy2-in", "Kim", 10, 20}, {"hy2-in", "bob", 50, 500}}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
@@ -458,13 +458,13 @@ func TestConnLogs(t *testing.T) {
 	feed(stamp+"[2 0ms] inbound/hysteria2[hy2_zoe]: inbound packet connection from [2001:db8::1]:5000", true)
 	feed(stamp+"[2 0ms] inbound/hysteria2[hy2_zoe]: inbound packet connection to 1.1.1.1:53", true)
 	feed(stamp+"[3 0ms] inbound/vless[vless]: inbound multiplex connection from 198.51.100.7:9", true)
-	feed(stamp+"[3 0ms] inbound/vless[vless]: [LF] inbound multiplex connection to sp.mux.sing-box.arpa:444", true)
-	feed(stamp+"[4 0ms] inbound/vless[vless]: [LF] inbound connection to www.gstatic.com:443", true)
+	feed(stamp+"[3 0ms] inbound/vless[vless]: [Kim] inbound multiplex connection to sp.mux.sing-box.arpa:444", true)
+	feed(stamp+"[4 0ms] inbound/vless[vless]: [Kim] inbound connection to www.gstatic.com:443", true)
 	// Restart backfill is not logged.
 	feed(stamp+"[5 0ms] inbound/shadowsocks[ss_multi]: inbound connection from 203.0.113.9:2000", false)
 	feed(stamp+"[5 0ms] inbound/shadowsocks[ss_multi]: [ZOE] inbound connection to old.example.org:443", false)
 
-	inbounds := []Inbound{{Tag: "ss_multi", Users: []string{"ZOE", "LF"}}, {Tag: "hy2_zoe", Users: []string{"zoe"}}, {Tag: "vless", Users: []string{"LF", "x"}}}
+	inbounds := []Inbound{{Tag: "ss_multi", Users: []string{"ZOE", "Kim"}}, {Tag: "hy2_zoe", Users: []string{"zoe"}}, {Tag: "vless", Users: []string{"Kim", "x"}}}
 	logs, dropped := tr.connLogs(inbounds)
 	if dropped != 0 || len(logs) != 3 {
 		t.Fatalf("want 3 logs (mux carrier and backfill left out), got %d %#v", len(logs), logs)
@@ -472,7 +472,7 @@ func TestConnLogs(t *testing.T) {
 	want := []ConnLog{
 		{T: 1792126805, Tag: "ss_multi", User: "ZOE", Src: "203.0.113.9:1000", Dst: "video.example.org:443", Net: "tcp"},
 		{T: 1792126805, Tag: "hy2_zoe", User: "zoe", Src: "[2001:db8::1]:5000", Dst: "1.1.1.1:53", Net: "udp"},
-		{T: 1792126805, Tag: "vless", User: "LF", Dst: "www.gstatic.com:443", Net: "tcp", Probe: true},
+		{T: 1792126805, Tag: "vless", User: "Kim", Dst: "www.gstatic.com:443", Net: "tcp", Probe: true},
 	}
 	for i := range want {
 		if logs[i] != want[i] {
