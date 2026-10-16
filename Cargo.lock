@@ -943,7 +943,7 @@ dependencies = [
 
 [[package]]
 name = "monitor-hub"
-version = "1.4.1-sb.3"
+version = "1.4.1-sb.4"
 dependencies = [
  "anyhow",
  "argon2",

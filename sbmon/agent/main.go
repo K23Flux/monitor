@@ -31,7 +31,7 @@ import (
 )
 
 const (
-	version        = "0.5.0"
+	version        = "0.6.0"
 	configFile     = "/etc/sb-agent/config.json"
 	stateFile      = "/var/lib/sb-agent/state.json"
 	singBoxConfig  = "/etc/sing-box/config.json"
@@ -154,6 +154,24 @@ type Report struct {
 	// read from sing-box's clash_api (per connection) and attributed to users
 	// through the log. Empty when the config has no clash_api.
 	UserTraffic []UserTraffic `json:"user_traffic,omitempty"`
+	// Conns is every connection logged on a tagged inbound since the last
+	// accepted report, for the per-user connection log. At most
+	// maxConnsPerReport; the rest are only counted in ConnsDropped.
+	Conns        []ConnLog `json:"conns,omitempty"`
+	ConnsDropped int       `json:"conns_dropped,omitempty"`
+}
+
+// ConnLog is one connection sing-box routed: when, on which inbound, whose
+// (the "[user]" sing-box prints, or the only user of a single-user inbound),
+// from where to where.
+type ConnLog struct {
+	T     int64  `json:"t"`
+	Tag   string `json:"tag"`
+	User  string `json:"user,omitempty"`
+	Src   string `json:"src,omitempty"`
+	Dst   string `json:"dst"`
+	Net   string `json:"net"`
+	Probe bool   `json:"probe,omitempty"`
 }
 
 type UserTraffic struct {
@@ -466,6 +484,7 @@ func collectAndReport(cfg *Config, state *AgentState) error {
 		Activity:    activity,
 		UserTraffic: userTraffic,
 	}
+	report.Conns, report.ConnsDropped = tracker.connLogs(inbounds)
 	var response apiResponse
 	if err := postJSON(cfg.Server+apiPrefix+"/agent/report", cfg.AgentToken, report, &response); err != nil {
 		return err
@@ -850,6 +869,10 @@ type connTracker struct {
 	// connection is, since clash_api reports addresses but not users.
 	peerOf     map[string]string
 	userOfPeer map[string]peerUser
+	// logs are the connections for the per-user log, kept until a report
+	// carrying them is accepted.
+	logs        []ConnLog
+	logsDropped int
 }
 
 type peerUser struct {
@@ -871,6 +894,7 @@ var tracker = newConnTracker()
 
 const (
 	maxVisitsPerReport = 500
+	maxConnsPerReport  = 3000
 	backfillSeconds    = 12 * 3600
 	closedConnGrace    = 30
 )
@@ -879,6 +903,55 @@ const (
 // Until then it keeps growing, so a failed upload never loses visits.
 func (t *connTracker) commit() {
 	t.acc = map[string]*tagAccumulator{}
+	t.logs = nil
+	t.logsDropped = 0
+}
+
+// connLogs returns the connections waiting to be reported. A connection
+// sing-box logged without a user name on an inbound that has exactly one
+// user is that user's.
+func (t *connTracker) connLogs(inbounds []Inbound) ([]ConnLog, int) {
+	only := map[string]string{}
+	for _, inbound := range inbounds {
+		if inbound.Tag != "" && len(inbound.Users) == 1 {
+			only[inbound.Tag] = inbound.Users[0]
+		}
+	}
+	for i := range t.logs {
+		if t.logs[i].User == "" {
+			t.logs[i].User = only[t.logs[i].Tag]
+		}
+	}
+	return t.logs, t.logsDropped
+}
+
+// connNet names how a connection was carried, from the log's wording.
+func connNet(kind string) string {
+	switch kind {
+	case "packet":
+		return "udp"
+	case "multiplex":
+		return "mux"
+	}
+	return "tcp"
+}
+
+func (t *connTracker) logConn(entry ConnLog) {
+	if len(t.logs) >= maxConnsPerReport {
+		t.logsDropped++
+		return
+	}
+	t.logs = append(t.logs, entry)
+}
+
+var lineUserRe = regexp.MustCompile(`\]: \[([^\]]+)\] inbound (?:multiplex |packet )?connection to `)
+
+// lineUser is the user sing-box named on a "connection to" line, if any.
+func lineUser(raw string) string {
+	if m := lineUserRe.FindStringSubmatch(ansiRe.ReplaceAllString(raw, "")); m != nil {
+		return m[1]
+	}
+	return ""
 }
 
 func (t *connTracker) accumulator(tag string) *tagAccumulator {
@@ -947,7 +1020,7 @@ func (t *connTracker) noteUser(raw string, ts int64) {
 // handleLine feeds one parsed connection line into the tracker. record=false is
 // used when rebuilding the connection table after an agent restart: the
 // connections are learned, but nothing is reported as new activity.
-func (t *connTracker) handleLine(ts int64, id, tag, kind, dir, peer string, record bool) {
+func (t *connTracker) handleLine(ts int64, id, tag, kind, dir, peer, user string, record bool) {
 	if dir == "from" {
 		if len(t.peerOf) > 50000 {
 			t.peerOf = map[string]string{}
@@ -975,6 +1048,11 @@ func (t *connTracker) handleLine(ts int64, id, tag, kind, dir, peer string, reco
 	}
 	if !record {
 		return
+	}
+	// The multiplex carrier itself goes to a placeholder address; the streams
+	// inside it are logged as connections of their own.
+	if !strings.HasSuffix(host, ".sing-box.arpa") {
+		t.logConn(ConnLog{T: ts, Tag: tag, User: user, Src: t.peerOf[id], Dst: peer, Net: connNet(kind), Probe: probe})
 	}
 	entry := t.accumulator(tag)
 	if probe {
@@ -1130,7 +1208,7 @@ func collectInboundActivity(service string, sinceUnix int64, inbounds []Inbound)
 		if procOK && len(established) > 0 {
 			_, _ = scanJournal(service, []string{"--since", "@" + strconv.FormatInt(now-backfillSeconds, 10)}, func(raw string) {
 				if ts, id, tag, kind, dir, peer, ok := parseJournalLine(raw); ok && tags[tag] {
-					t.handleLine(ts, id, tag, kind, dir, peer, false)
+					t.handleLine(ts, id, tag, kind, dir, peer, "", false)
 					t.noteUser(raw, ts)
 				}
 			})
@@ -1150,7 +1228,7 @@ func collectInboundActivity(service string, sinceUnix int64, inbounds []Inbound)
 	}
 	cursor, err := scanJournal(service, extra, func(raw string) {
 		if ts, id, tag, kind, dir, peer, ok := parseJournalLine(raw); ok && tags[tag] {
-			t.handleLine(ts, id, tag, kind, dir, peer, true)
+			t.handleLine(ts, id, tag, kind, dir, peer, lineUser(raw), true)
 			t.noteUser(raw, ts)
 		}
 	})
@@ -1225,7 +1303,7 @@ func collectInboundActivityFromLines(lines []string, inbounds []Inbound, now int
 	t := tracker
 	for _, raw := range lines {
 		if ts, id, tag, kind, dir, peer, ok := parseLogFileLine(raw, now); ok && tags[tag] {
-			t.handleLine(ts, id, tag, kind, dir, peer, true)
+			t.handleLine(ts, id, tag, kind, dir, peer, lineUser(raw), true)
 			t.noteUser(raw, ts)
 		}
 	}

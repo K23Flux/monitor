@@ -3,7 +3,7 @@
 // sbmon module under /api/sbmonitor/v1 (src/sbmon).
 
 import { useCallback, useEffect, useMemo, useState } from "react"
-import { ChevronDown, ChevronRight, Copy, LineChart, Pencil, RefreshCw, Send, Trash2 } from "lucide-react"
+import { ChevronDown, ChevronRight, Copy, LineChart, ListTree, Pencil, RefreshCw, Send, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -338,27 +338,239 @@ function LinkSelect({ node, hubNodes, onDone }: { node: SbNode; hubNodes: HubNod
   )
 }
 
-/** This month's traffic per user across every server, matched by name ignoring case. */
-function UsersSummary({ nodes }: { nodes: SbNode[] }) {
-  const sums = new Map<string, { name: string; today: number; month: number; where: Set<string> }>()
+// ---- per-user connection log ------------------------------------------------
+
+type LogItem = { t: number; tag: string; user: string; src: string; dst: string; net: string; probe?: boolean; node: string; nodeId: string }
+type LogResult = {
+  date: string
+  total: number
+  probes: number
+  dropped: number
+  truncated: boolean
+  items: LogItem[]
+  hosts: { host: string; count: number; last: number }[]
+  nodes: { id: string; name: string; count: number }[]
+  users: { user: string; count: number }[]
+}
+
+const ALL_USERS = ""
+const UNKNOWN_USER = "?"
+const timeOf = (t: number) => new Date(t * 1000).toLocaleTimeString("zh-CN", { hour12: false })
+
+/** A user name that opens that user's connection log. */
+function UserLink({ user, onOpen, className = "" }: { user: string; onOpen: (user: string) => void; className?: string }) {
+  return (
+    <button
+      type="button"
+      title="看这个用户的连接日志"
+      className={`underline-offset-2 hover:underline ${className}`}
+      onClick={(e) => { e.stopPropagation(); onOpen(user) }}
+    >
+      {user}
+    </button>
+  )
+}
+
+/**
+ * One user's connections on one day: which server and inbound, from where,
+ * to where. Names match ignoring case, so WTY on one server and wty on
+ * another are one person. Today's log refreshes every 10 seconds.
+ */
+export function UserLogDialog({ user: initialUser, nodeId: initialNode = "", onClose }: { user: string; nodeId?: string; onClose: () => void }) {
+  const [user, setUser] = useState(initialUser)
+  const [nodeId, setNodeId] = useState(initialNode)
+  const [date, setDate] = useState("")
+  const [search, setSearch] = useState("")
+  const [query, setQuery] = useState("")
+  const [probes, setProbes] = useState(false)
+  const [byHost, setByHost] = useState(false)
+  const [data, setData] = useState<LogResult | null>(null)
+  const [error, setError] = useState("")
+  const [nodes, setNodes] = useState<{ id: string; name: string }[]>([])
+
+  useEffect(() => {
+    api<SbState>(`${SB}/state`).then((st) => setNodes(st.nodes.map((n) => ({ id: n.id, name: n.name })))).catch(() => {})
+  }, [])
+
+  const path = useMemo(() => {
+    const p = new URLSearchParams({ user, date, node_id: nodeId, q: query, probes: probes ? "1" : "" })
+    return `${SB}/userlog?${p}`
+  }, [user, date, nodeId, query, probes])
+
+  useEffect(() => {
+    let live = true
+    const load = () => api<LogResult>(path)
+      .then((r) => { if (live) { setData(r); setError("") } })
+      .catch((e: Error) => { if (live) setError(e.message) })
+    load()
+    // Only today's log grows.
+    const timer = date === "" ? setInterval(() => { if (!document.hidden) load() }, 10000) : undefined
+    return () => { live = false; if (timer) clearInterval(timer) }
+  }, [path, date])
+
+  const who = user === ALL_USERS ? "全部用户" : user === UNKNOWN_USER ? "未识别用户" : user
+  const userOptions = useMemo(() => {
+    const seen = new Map<string, string>()
+    for (const u of data?.users ?? []) if (u.user) seen.set(u.user.toLowerCase(), u.user)
+    if (user && user !== UNKNOWN_USER && !seen.has(user.toLowerCase())) seen.set(user.toLowerCase(), user)
+    return [...seen.values()].sort((a, b) => a.localeCompare(b))
+  }, [data, user])
+  const selected = userOptions.find((u) => u.toLowerCase() === user.toLowerCase()) ?? user
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="flex max-h-[90vh] flex-col sm:max-w-5xl">
+        <DialogHeader>
+          <DialogTitle>{who} 的连接日志</DialogTitle>
+          <DialogDescription>
+            {"每条是 sing-box 路由出去的一个连接：哪台服务器、哪个入站、来源地址和目标。用户名不分大小写。"}
+            {date === "" && "今天的记录每 10 秒刷新。"}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="flex flex-wrap items-center gap-2 text-sm">
+          <select className="h-8 rounded-md border bg-transparent px-2 text-xs" value={selected} onChange={(e) => setUser(e.target.value)}>
+            <option value={ALL_USERS}>全部用户</option>
+            {userOptions.map((u) => <option key={u} value={u}>{u}</option>)}
+            <option value={UNKNOWN_USER}>未识别</option>
+          </select>
+          <Input
+            type="date"
+            className="h-8 w-40 text-xs"
+            value={date || data?.date || ""}
+            onChange={(e) => setDate(e.target.value)}
+          />
+          {date !== "" && <Button variant="ghost" size="sm" onClick={() => setDate("")}>今天</Button>}
+          <select className="h-8 rounded-md border bg-transparent px-2 text-xs" value={nodeId} onChange={(e) => setNodeId(e.target.value)}>
+            <option value="">全部服务器</option>
+            {nodes.map((n) => <option key={n.id} value={n.id}>{n.name}</option>)}
+          </select>
+          <form className="flex gap-1" onSubmit={(e) => { e.preventDefault(); setQuery(search) }}>
+            <Input className="h-8 w-48 text-xs" value={search} placeholder="搜索目标或来源，回车" onChange={(e) => setSearch(e.target.value)} />
+            {query && <Button type="button" variant="ghost" size="sm" onClick={() => { setSearch(""); setQuery("") }}>清除</Button>}
+          </form>
+          <label className="flex items-center gap-1.5 text-xs">
+            <Switch checked={probes} onCheckedChange={setProbes} />
+            显示测速探测
+          </label>
+          <label className="flex items-center gap-1.5 text-xs">
+            <Switch checked={byHost} onCheckedChange={setByHost} />
+            按目标汇总
+          </label>
+        </div>
+
+        {error && <p className="text-sm text-destructive">{error}</p>}
+        {!data ? (
+          <p className="text-sm text-muted-foreground">加载中…</p>
+        ) : (
+          <>
+            <p className="text-xs text-muted-foreground">
+              {data.date} · {data.total} 条连接 · {data.hosts.length} 个目标
+              {data.nodes.length > 0 && ` · ${data.nodes.map((n) => `${n.name} ${n.count}`).join("、")}`}
+              {!probes && data.probes > 0 && ` · 测速探测 ${data.probes} 条已隐藏`}
+              {data.truncated && " · 只列出最近 3000 条"}
+            </p>
+            {data.dropped > 0 && (
+              <p className="text-xs text-amber-600">{`这天有 ${data.dropped} 条连接超过单次上报上限没记下（不分用户）。`}</p>
+            )}
+            <div className="min-h-0 flex-1 overflow-auto rounded-md border">
+              {data.total === 0 ? (
+                <p className="p-6 text-center text-sm text-muted-foreground">
+                  {"没有记录。sb-agent 0.6.0 起才上报连接明细，升级前的连接不会补。"}
+                </p>
+              ) : byHost ? (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>目标</TableHead>
+                      <TableHead className="text-right">次数</TableHead>
+                      <TableHead className="text-right">最后一次</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {data.hosts.map((h) => (
+                      <TableRow key={h.host}>
+                        <TableCell className="font-mono text-xs break-all">{h.host}</TableCell>
+                        <TableCell className="tnum text-right">{h.count}</TableCell>
+                        <TableCell className="tnum text-right text-xs">{timeOf(h.last)}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              ) : (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>时间</TableHead>
+                      <TableHead>服务器 / 入站</TableHead>
+                      {user === ALL_USERS && <TableHead>用户</TableHead>}
+                      <TableHead>来源</TableHead>
+                      <TableHead>目标</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {data.items.map((c, i) => (
+                      <TableRow key={`${c.t}-${i}`}>
+                        <TableCell className="tnum text-xs whitespace-nowrap">{timeOf(c.t)}</TableCell>
+                        <TableCell className="text-xs">
+                          <div>{c.node}</div>
+                          <div className="font-mono text-[11px] text-muted-foreground">{c.tag}</div>
+                        </TableCell>
+                        {user === ALL_USERS && (
+                          <TableCell className="text-xs">
+                            {c.user ? <UserLink user={c.user} onOpen={setUser} /> : <span className="text-muted-foreground">未识别</span>}
+                          </TableCell>
+                        )}
+                        <TableCell className="font-mono text-[11px] text-muted-foreground break-all">{c.src || "—"}</TableCell>
+                        <TableCell className="font-mono text-xs break-all">
+                          {c.dst}
+                          {c.net !== "tcp" && <span className="ml-1.5 rounded bg-muted px-1 text-[10px] text-muted-foreground">{c.net.toUpperCase()}</span>}
+                          {c.probe && <span className="ml-1.5 rounded bg-muted px-1 text-[10px] text-muted-foreground">探测</span>}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              )}
+            </div>
+          </>
+        )}
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+/**
+ * Every user the inbounds list, merged by name ignoring case, with this
+ * month's traffic where clash_api reports it. A name opens the connection log.
+ */
+function UsersSummary({ nodes, onOpen }: { nodes: SbNode[]; onOpen: (user: string) => void }) {
+  type Sum = { name: string; today: number; month: number; where: Set<string>; metered: boolean }
+  const sums = new Map<string, Sum>()
+  const entry = (user: string) => {
+    const key = user.toLowerCase()
+    const e = sums.get(key) ?? { name: user, today: 0, month: 0, where: new Set<string>(), metered: false }
+    sums.set(key, e)
+    return e
+  }
   for (const n of nodes) {
+    for (const p of n.ports) for (const u of p.users) entry(u).where.add(n.name)
     for (const u of n.users) {
       if (!u.user) continue
-      const key = u.user.toLowerCase()
-      const e = sums.get(key) ?? { name: u.user, today: 0, month: 0, where: new Set<string>() }
+      const e = entry(u.user)
       e.today += u.today.total
       e.month += u.month.total
+      e.metered = true
       e.where.add(n.name)
-      sums.set(key, e)
     }
   }
-  const rows = [...sums.values()].sort((a, b) => b.month - a.month)
+  const rows = [...sums.values()].sort((a, b) => b.month - a.month || a.name.localeCompare(b.name))
   if (!rows.length) return null
   return (
     <Card className="gap-2 p-5">
       <div className="flex items-baseline justify-between">
-        <h3 className="text-sm font-medium">用户流量</h3>
-        <span className="text-xs text-muted-foreground">所有服务器合计，按本月排序</span>
+        <h3 className="text-sm font-medium">用户</h3>
+        <span className="text-xs text-muted-foreground">点用户名看连接日志 · 流量是所有服务器合计（来自 clash_api）</span>
       </div>
       <Table>
         <TableHeader>
@@ -372,10 +584,10 @@ function UsersSummary({ nodes }: { nodes: SbNode[] }) {
         <TableBody>
           {rows.map((r) => (
             <TableRow key={r.name}>
-              <TableCell className="font-medium">{r.name}</TableCell>
+              <TableCell className="font-medium"><UserLink user={r.name} onOpen={onOpen} /></TableCell>
               <TableCell className="text-xs text-muted-foreground">{[...r.where].join("、")}</TableCell>
-              <TableCell className="tnum text-right">{bytes(r.today)}</TableCell>
-              <TableCell className="tnum text-right">{bytes(r.month)}</TableCell>
+              <TableCell className="tnum text-right">{r.metered ? bytes(r.today) : "—"}</TableCell>
+              <TableCell className="tnum text-right">{r.metered ? bytes(r.month) : "—"}</TableCell>
             </TableRow>
           ))}
         </TableBody>
@@ -391,6 +603,7 @@ export function SingBox({ hubNodes }: { hubNodes: HubNode[] }) {
   const [aliasing, setAliasing] = useState<{ node: SbNode; port: Port } | null>(null)
   const [charting, setCharting] = useState<{ node: SbNode; port: Port } | null>(null)
   const [deleting, setDeleting] = useState<SbNode | null>(null)
+  const [logOf, setLogOf] = useState<{ user: string; nodeId?: string } | null>(null)
 
   if (!data) return error ? <p className="text-sm text-destructive">{error}</p> : <p className="text-sm text-muted-foreground">加载中…</p>
 
@@ -428,7 +641,7 @@ export function SingBox({ hubNodes }: { hubNodes: HubNode[] }) {
         ))}
       </div>
 
-      <UsersSummary nodes={data.nodes} />
+      <UsersSummary nodes={data.nodes} onOpen={(user) => setLogOf({ user })} />
 
       {data.nodes.length === 0 && (
         <Card className="p-8 text-center text-sm text-muted-foreground">
@@ -500,7 +713,13 @@ export function SingBox({ hubNodes }: { hubNodes: HubNode[] }) {
                 <TableRow key={port.port}>
                   <TableCell>
                     <div className="font-medium">{port.displayName}</div>
-                    <div className="text-xs text-muted-foreground">{port.tag || "无 tag"}{port.users.length > 1 && ` · ${port.users.length} 个用户`}</div>
+                    <div className="text-xs text-muted-foreground">
+                      {port.tag || "无 tag"}
+                      {port.users.length > 0 && " · "}
+                      {port.users.map((u, i) => (
+                        <span key={u}>{i > 0 && "、"}<UserLink user={u} onOpen={(user) => setLogOf({ user, nodeId: node.id })} /></span>
+                      ))}
+                    </div>
                   </TableCell>
                   <TableCell className="tnum">{port.port}</TableCell>
                   <TableCell>{port.type || "未知"}</TableCell>
@@ -523,7 +742,7 @@ export function SingBox({ hubNodes }: { hubNodes: HubNode[] }) {
                 {node.users.map((u) => (
                   <div key={`${u.tag}|${u.user}`} className="flex items-baseline justify-between gap-3">
                     <span className="min-w-0 truncate">
-                      {u.user || <span className="text-muted-foreground">未识别</span>}
+                      {u.user ? <UserLink user={u.user} onOpen={(user) => setLogOf({ user, nodeId: node.id })} /> : <span className="text-muted-foreground">未识别</span>}
                       <span className="ml-1.5 font-mono text-[11px] text-muted-foreground">{u.tag}</span>
                     </span>
                     <span className="tnum shrink-0 text-xs text-muted-foreground">今日 {bytes(u.today.total)} · 本月 {bytes(u.month.total)}</span>
@@ -580,6 +799,7 @@ export function SingBox({ hubNodes }: { hubNodes: HubNode[] }) {
           onSave={async (alias) => { await post("/node/alias", { node_id: aliasing.node.id, port: aliasing.port.port, alias }); reload() }}
         />
       )}
+      {logOf && <UserLogDialog user={logOf.user} nodeId={logOf.nodeId} onClose={() => setLogOf(null)} />}
       {charting && <HistoryDialog node={charting.node} port={charting.port} onClose={() => setCharting(null)} />}
       {deleting && (
         <Dialog open onOpenChange={(open) => !open && setDeleting(null)}>
@@ -826,6 +1046,7 @@ function WatchSettings({ onSaved }: { onSaved: () => void }) {
         {field("offline_seconds", "节点离线判定（秒）", "60")}
         {field("timezone_offset", "统计时区（UTC 偏移）", "8")}
         {field("history_days", "分钟历史保留天数", "30")}
+        {field("userlog_days", "连接日志保留天数", "7", "点用户名看到的连接明细，1 到 90 天")}
       </div>
       <div className="flex flex-wrap gap-6">
         {(["notify_online", "notify_offline", "notify_status"] as const).map((k) => (
@@ -845,6 +1066,7 @@ function WatchSettings({ onSaved }: { onSaved: () => void }) {
 
 export function ConnWatch() {
   const { data, error, reload } = usePoll<WatchState>(`${SB}/watch`)
+  const [logOf, setLogOf] = useState<string | null>(null)
   if (!data) return error ? <p className="text-sm text-destructive">{error}</p> : <p className="text-sm text-muted-foreground">加载中…</p>
   const now = new Date(data.server_time).getTime()
   const groups = new Map<string, WatchRow[]>()
@@ -877,6 +1099,9 @@ export function ConnWatch() {
               <span className={`size-2 rounded-full ${rows.some((r) => r.online) ? "bg-emerald-500" : "bg-muted-foreground/40"}`} />
               <span className="font-medium">{label}</span>
               <span className="text-xs text-muted-foreground">{rows.some((r) => r.online) ? "在线" : "离线"}</span>
+              <Button variant="ghost" size="sm" className="ml-auto" onClick={() => setLogOf(label)}>
+                <ListTree className="size-4" /> 连接日志
+              </Button>
             </div>
             <div className="divide-y">
               {rows.map((r) => (
@@ -932,6 +1157,7 @@ export function ConnWatch() {
       </Card>
 
       <WatchSettings onSaved={reload} />
+      {logOf && <UserLogDialog user={logOf} onClose={() => setLogOf(null)} />}
     </div>
   )
 }

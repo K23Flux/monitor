@@ -128,6 +128,8 @@ pub struct Config {
     pub timezone_offset: f64,
     pub offline_seconds: f64,
     pub history_days: f64,
+    /// Days of per-user connection log kept (see `userlog`).
+    pub userlog_days: f64,
     pub session_idle_seconds: f64,
     pub offline_grace_seconds: f64,
     pub online_confirm_seconds: f64,
@@ -148,10 +150,11 @@ impl Default for Config {
 
 /// Every setting the module keeps, under its Komari plugin key. Stored in the
 /// hub's `setting` table with an `sbmon_` prefix.
-pub const CONFIG_KEYS: [&str; 12] = [
+pub const CONFIG_KEYS: [&str; 13] = [
     "timezone_offset",
     "offline_seconds",
     "history_days",
+    "userlog_days",
     "session_idle_seconds",
     "offline_grace_seconds",
     "online_confirm_seconds",
@@ -200,6 +203,7 @@ impl Config {
             timezone_offset: clamp_number(get("timezone_offset"), 8.0, -12.0, 14.0),
             offline_seconds: clamp_number(get("offline_seconds"), 60.0, 15.0, 3600.0),
             history_days: clamp_number(get("history_days"), 30.0, 1.0, 365.0),
+            userlog_days: clamp_number(get("userlog_days"), 7.0, 1.0, 90.0),
             session_idle_seconds: clamp_number(get("session_idle_seconds"), 300.0, 30.0, 86400.0),
             offline_grace_seconds: clamp_number(get("offline_grace_seconds"), 60.0, 10.0, 3600.0),
             online_confirm_seconds: clamp_number(get("online_confirm_seconds"), 15.0, 0.0, 600.0),
@@ -249,6 +253,7 @@ impl Config {
             "timezoneOffset": self.timezone_offset,
             "offlineSeconds": self.offline_seconds,
             "historyDays": self.history_days,
+            "userlogDays": self.userlog_days,
             "sessionIdleSeconds": self.session_idle_seconds,
             "offlineGraceSeconds": self.offline_grace_seconds,
             "onlineConfirmSeconds": self.online_confirm_seconds,

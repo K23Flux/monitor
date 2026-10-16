@@ -183,7 +183,7 @@ func TestTrackerLiveAndVisits(t *testing.T) {
 		if !ok {
 			t.Fatalf("line not parsed: %s", raw)
 		}
-		tr.handleLine(ts, id, tag, kind, dir, peer, record)
+		tr.handleLine(ts, id, tag, kind, dir, peer, lineUser(raw), record)
 	}
 	prefix := "1791765813.680464 host sing-box[1]: \x1b[36mINFO\x1b[0m[1] "
 	feed(prefix+"[11 0ms] inbound/shadowsocks[ss2022_wty]: inbound connection from 203.0.113.9:1000", true)
@@ -381,7 +381,7 @@ func TestClashUsageAttributesTrafficToUsers(t *testing.T) {
 		if !ok {
 			t.Fatalf("unparsed: %s", raw)
 		}
-		tr.handleLine(ts, id, tag, kind, dir, peer, true)
+		tr.handleLine(ts, id, tag, kind, dir, peer, lineUser(raw), true)
 		tr.noteUser(raw, ts)
 	}
 	conn := func(id, ip, port string, up, down uint64) clashConn {
@@ -439,5 +439,54 @@ func TestClashAPIFromConfigOnlyLoopback(t *testing.T) {
 	}
 	if a := clashAPIFrom(write("203.0.113.5:19090")); a != nil {
 		t.Fatal("a remote controller is never used")
+	}
+}
+
+func TestConnLogs(t *testing.T) {
+	tr := newConnTracker()
+	feed := func(raw string, record bool) {
+		ts, id, tag, kind, dir, peer, ok := parseLogFileLine(raw, 100)
+		if !ok {
+			t.Fatalf("unparsed: %s", raw)
+		}
+		tr.handleLine(ts, id, tag, kind, dir, peer, lineUser(raw), record)
+		tr.noteUser(raw, ts)
+	}
+	stamp := "+0800 2026-10-16 13:00:05 INFO "
+	feed(stamp+"[1 0ms] inbound/shadowsocks[ss_multi]: inbound connection from 203.0.113.9:1000", true)
+	feed(stamp+"[1 0ms] inbound/shadowsocks[ss_multi]: [WTY] inbound connection to video.example.org:443", true)
+	feed(stamp+"[2 0ms] inbound/hysteria2[hy2_wty]: inbound packet connection from [2001:db8::1]:5000", true)
+	feed(stamp+"[2 0ms] inbound/hysteria2[hy2_wty]: inbound packet connection to 1.1.1.1:53", true)
+	feed(stamp+"[3 0ms] inbound/vless[vless]: inbound multiplex connection from 198.51.100.7:9", true)
+	feed(stamp+"[3 0ms] inbound/vless[vless]: [LF] inbound multiplex connection to sp.mux.sing-box.arpa:444", true)
+	feed(stamp+"[4 0ms] inbound/vless[vless]: [LF] inbound connection to www.gstatic.com:443", true)
+	// Restart backfill is not logged.
+	feed(stamp+"[5 0ms] inbound/shadowsocks[ss_multi]: inbound connection from 203.0.113.9:2000", false)
+	feed(stamp+"[5 0ms] inbound/shadowsocks[ss_multi]: [WTY] inbound connection to old.example.org:443", false)
+
+	inbounds := []Inbound{{Tag: "ss_multi", Users: []string{"WTY", "LF"}}, {Tag: "hy2_wty", Users: []string{"wty"}}, {Tag: "vless", Users: []string{"LF", "x"}}}
+	logs, dropped := tr.connLogs(inbounds)
+	if dropped != 0 || len(logs) != 3 {
+		t.Fatalf("want 3 logs (mux carrier and backfill left out), got %d %#v", len(logs), logs)
+	}
+	want := []ConnLog{
+		{T: 1792126805, Tag: "ss_multi", User: "WTY", Src: "203.0.113.9:1000", Dst: "video.example.org:443", Net: "tcp"},
+		{T: 1792126805, Tag: "hy2_wty", User: "wty", Src: "[2001:db8::1]:5000", Dst: "1.1.1.1:53", Net: "udp"},
+		{T: 1792126805, Tag: "vless", User: "LF", Dst: "www.gstatic.com:443", Net: "tcp", Probe: true},
+	}
+	for i := range want {
+		if logs[i] != want[i] {
+			t.Fatalf("log %d: got %#v want %#v", i, logs[i], want[i])
+		}
+	}
+	tr.commit()
+	if logs, _ := tr.connLogs(inbounds); len(logs) != 0 {
+		t.Fatalf("commit must clear the log")
+	}
+	for i := 0; i < maxConnsPerReport+5; i++ {
+		tr.logConn(ConnLog{Tag: "x"})
+	}
+	if logs, dropped := tr.connLogs(nil); len(logs) != maxConnsPerReport || dropped != 5 {
+		t.Fatalf("cap: %d %d", len(logs), dropped)
 	}
 }
