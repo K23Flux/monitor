@@ -43,6 +43,12 @@ jobs:
       - run: npm ci && npm run build
         working-directory: web-admin
 
+      # sb-agent for the sing-box monitor, embedded by the hub from sbmon/bin.
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: sbmon/agent/go.mod
+      - run: ./sbmon/build-agent.sh
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}

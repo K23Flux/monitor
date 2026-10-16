@@ -300,7 +300,12 @@ export function provisionRefusal(origin: string, site: string): string {
 }
 
 /** `1.2.3` as numbers, or null for anything else. */
-const versionParts = (v: string) => (/^\d+(\.\d+)*$/.test(v) ? v.split(".").map(Number) : null)
+// K23Flux fork builds carry a `-sb.N` suffix on the upstream version they are
+// based on; compared against upstream releases they count as that version.
+const versionParts = (v: string) => {
+  const base = v.replace(/-sb\.\d+$/, "")
+  return /^\d+(\.\d+)*$/.test(base) ? base.split(".").map(Number) : null
+}
 
 /**
  * Whether `current` names an earlier release than `latest`; missing components

@@ -1,5 +1,7 @@
 # monitor
 
+> K23Flux 的 fork：在上游基础上内置了 sing-box 监控（各入站端口流量、按入站的用户上线 / 下线监控和独立的 Telegram 通知），说明见 [sbmon/README.md](sbmon/README.md)。
+
 文档：[monitor-document.pages.dev](https://monitor-document.pages.dev)，安装、配置、反向代理与主题开发都在这里。
 
 主题站：[monitor-themes.pages.dev](https://monitor-themes.pages.dev)，在线预览各个公开页主题，复制地址即可在面板安装。
