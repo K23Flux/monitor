@@ -3,7 +3,7 @@
 // sbmon module under /api/sbmonitor/v1 (src/sbmon).
 
 import { useCallback, useEffect, useMemo, useState } from "react"
-import { ChevronDown, ChevronRight, Copy, LineChart, Pencil, Plus, RefreshCw, Send, Trash2 } from "lucide-react"
+import { ChevronDown, ChevronRight, Copy, LineChart, Pencil, RefreshCw, Send, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -44,8 +44,10 @@ type SbNode = {
   ports: Port[]
   hubNodeId: number | null
   watchUsers: boolean
+  users: UserRow[]
   singboxDownSince: string | null
 }
+type UserRow = { tag: string; user: string; today: Traffic; month: Traffic }
 type SbEvent = { id: string; nodeName: string; time: string; level: string; message: string }
 type SbState = {
   version: string
@@ -336,6 +338,52 @@ function LinkSelect({ node, hubNodes, onDone }: { node: SbNode; hubNodes: HubNod
   )
 }
 
+/** This month's traffic per user across every server, matched by name ignoring case. */
+function UsersSummary({ nodes }: { nodes: SbNode[] }) {
+  const sums = new Map<string, { name: string; today: number; month: number; where: Set<string> }>()
+  for (const n of nodes) {
+    for (const u of n.users) {
+      if (!u.user) continue
+      const key = u.user.toLowerCase()
+      const e = sums.get(key) ?? { name: u.user, today: 0, month: 0, where: new Set<string>() }
+      e.today += u.today.total
+      e.month += u.month.total
+      e.where.add(n.name)
+      sums.set(key, e)
+    }
+  }
+  const rows = [...sums.values()].sort((a, b) => b.month - a.month)
+  if (!rows.length) return null
+  return (
+    <Card className="gap-2 p-5">
+      <div className="flex items-baseline justify-between">
+        <h3 className="text-sm font-medium">用户流量</h3>
+        <span className="text-xs text-muted-foreground">所有服务器合计，按本月排序</span>
+      </div>
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead>用户</TableHead>
+            <TableHead>服务器</TableHead>
+            <TableHead className="text-right">今日</TableHead>
+            <TableHead className="text-right">本月</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {rows.map((r) => (
+            <TableRow key={r.name}>
+              <TableCell className="font-medium">{r.name}</TableCell>
+              <TableCell className="text-xs text-muted-foreground">{[...r.where].join("、")}</TableCell>
+              <TableCell className="tnum text-right">{bytes(r.today)}</TableCell>
+              <TableCell className="tnum text-right">{bytes(r.month)}</TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </Card>
+  )
+}
+
 export function SingBox({ hubNodes }: { hubNodes: HubNode[] }) {
   const { data, error, reload } = usePoll<SbState>(`${SB}/state`)
   const [adding, setAdding] = useState(false)
@@ -366,7 +414,6 @@ export function SingBox({ hubNodes }: { hubNodes: HubNode[] }) {
         </div>
         <div className="flex gap-2">
           <Button variant="outline" size="sm" onClick={reload}><RefreshCw className="size-4" /> 刷新</Button>
-          <Button size="sm" variant="outline" onClick={() => setAdding(true)}><Plus className="size-4" /> 单独安装</Button>
         </div>
       </div>
       {error && <p className="text-sm text-destructive">{error}</p>}
@@ -380,6 +427,8 @@ export function SingBox({ hubNodes }: { hubNodes: HubNode[] }) {
           </Card>
         ))}
       </div>
+
+      <UsersSummary nodes={data.nodes} />
 
       {data.nodes.length === 0 && (
         <Card className="p-8 text-center text-sm text-muted-foreground">
@@ -467,6 +516,22 @@ export function SingBox({ hubNodes }: { hubNodes: HubNode[] }) {
               ))}
             </TableBody>
           </Table>
+          {node.users.length > 0 && (
+            <div className="border-t px-4 py-3">
+              <div className="mb-2 text-xs font-medium text-muted-foreground">按用户（来自 clash_api）</div>
+              <div className="grid gap-x-6 gap-y-1 text-sm sm:grid-cols-2 xl:grid-cols-3">
+                {node.users.map((u) => (
+                  <div key={`${u.tag}|${u.user}`} className="flex items-baseline justify-between gap-3">
+                    <span className="min-w-0 truncate">
+                      {u.user || <span className="text-muted-foreground">未识别</span>}
+                      <span className="ml-1.5 font-mono text-[11px] text-muted-foreground">{u.tag}</span>
+                    </span>
+                    <span className="tnum shrink-0 text-xs text-muted-foreground">今日 {bytes(u.today.total)} · 本月 {bytes(u.month.total)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </Card>
       ))}
 
@@ -489,6 +554,11 @@ export function SingBox({ hubNodes }: { hubNodes: HubNode[] }) {
           </div>
         )}
       </Card>
+
+      <p className="text-xs text-muted-foreground">
+        {"sing-box 监控随「节点」页的安装命令自动装。只想装 sing-box 监控、不装整机探针的机器："}
+        <button className="ml-1 underline underline-offset-2 hover:text-foreground" onClick={() => setAdding(true)}>单独安装</button>
+      </p>
 
       {adding && <AddNodeDialog onClose={() => setAdding(false)} onDone={reload} />}
       {renaming && (
@@ -752,7 +822,7 @@ function WatchSettings({ onSaved }: { onSaved: () => void }) {
         {field("tg_chat_id", "Chat ID", "123456789")}
         {field("online_confirm_seconds", "上线确认（秒）", "15", "只有一条连接时，保持这么久才算上线")}
         {field("offline_grace_seconds", "下线确认（秒）", "60", "连接全断后等这么久没有新连接才算下线")}
-        {field("session_idle_seconds", "空闲判定（秒）", "300", "Hysteria2、TUIC、mux 这类数不出在连数的入站，多久没有新连接算下线")}
+        {field("session_idle_seconds", "空闲判定（秒）", "300", "没开 clash_api 的机器上，Hysteria2、TUIC、mux 这类数不出在连数的入站，多久没有新连接算下线")}
         {field("offline_seconds", "节点离线判定（秒）", "60")}
         {field("timezone_offset", "统计时区（UTC 偏移）", "8")}
         {field("history_days", "分钟历史保留天数", "30")}

@@ -425,6 +425,9 @@ pub struct State {
     pub nodes: BTreeMap<String, Node>,
     pub registrations: BTreeMap<String, Registration>,
     pub daily: Daily,
+    /// Traffic per inbound user, `day → node → "tag|user" → totals`, from the
+    /// agents' clash_api readings (sb-agent 0.5.0 with clash_api enabled).
+    pub daily_users: Daily,
     pub events: Vec<Event>,
     pub watch: BTreeMap<String, Watch>,
     pub user_events: Vec<UserEvent>,
@@ -439,6 +442,7 @@ impl Default for State {
             nodes: BTreeMap::new(),
             registrations: BTreeMap::new(),
             daily: BTreeMap::new(),
+            daily_users: BTreeMap::new(),
             events: Vec::new(),
             watch: BTreeMap::new(),
             user_events: Vec::new(),
@@ -757,6 +761,32 @@ impl Engine {
         }
         for text in status {
             self.enqueue_telegram(text, now);
+        }
+        if let Some(items) = body.get("user_traffic").and_then(Value::as_array) {
+            let day = self.config.date_key(now);
+            for item in items.iter().take(500) {
+                let get = |k: &str| item.get(k).unwrap_or(&Value::Null);
+                let tag = clean_text(&text(get("tag")), 100);
+                if tag.is_empty() {
+                    continue;
+                }
+                let user = clean_name(&text(get("user")));
+                let (up, down) = (safe_count(get("upload")), safe_count(get("download")));
+                if up == 0.0 && down == 0.0 {
+                    continue;
+                }
+                let slot = self
+                    .state
+                    .daily_users
+                    .entry(day.clone())
+                    .or_default()
+                    .entry(node_id.clone())
+                    .or_default()
+                    .entry(format!("{tag}|{user}"))
+                    .or_default();
+                slot.upload += up;
+                slot.download += down;
+            }
         }
 
         if let Some(events) = body.get("events").and_then(Value::as_array) {
@@ -1170,10 +1200,44 @@ impl Engine {
             "singbox": node.singbox,
             "ports": ports,
             "lastActivity": node.last_activity,
+            "users": self.user_traffic(&node.id, now),
             "hubNodeId": node.hub_node_id,
             "watchUsers": !node.watch_off,
             "singboxDownSince": node.singbox_down_since,
         })
+    }
+
+    /// This node's traffic per inbound user, today and this month, busiest first.
+    fn user_traffic(&self, node_id: &str, now: DateTime<Utc>) -> Vec<Value> {
+        let today = self.config.date_key(now);
+        let month = &today[..7];
+        let mut sums: BTreeMap<&str, [f64; 4]> = BTreeMap::new();
+        for (day, by_node) in self.state.daily_users.range(month.to_owned()..) {
+            if !day.starts_with(month) {
+                continue;
+            }
+            for (key, t) in by_node.get(node_id).into_iter().flatten() {
+                let s = sums.entry(key.as_str()).or_default();
+                s[2] += t.upload;
+                s[3] += t.download;
+                if *day == today {
+                    s[0] += t.upload;
+                    s[1] += t.download;
+                }
+            }
+        }
+        let mut rows: Vec<(&str, [f64; 4])> = sums.into_iter().collect();
+        rows.sort_by(|a, b| (b.1[2] + b.1[3]).total_cmp(&(a.1[2] + a.1[3])));
+        rows.into_iter()
+            .map(|(key, s)| {
+                let (tag, user) = key.split_once('|').unwrap_or((key, ""));
+                json!({
+                    "tag": tag, "user": user,
+                    "today": {"upload": s[0], "download": s[1], "total": s[0] + s[1]},
+                    "month": {"upload": s[2], "download": s[3], "total": s[2] + s[3]},
+                })
+            })
+            .collect()
     }
 
     pub fn admin_state(&mut self, now: DateTime<Utc>) -> Value {
@@ -1464,7 +1528,7 @@ impl Engine {
         if self.state.nodes.remove(node_id).is_none() {
             return Err("节点不存在");
         }
-        for by_node in self.state.daily.values_mut() {
+        for by_node in self.state.daily.values_mut().chain(self.state.daily_users.values_mut()) {
             by_node.remove(node_id);
         }
         self.state.events.retain(|e| e.node_id != node_id);
@@ -1500,5 +1564,6 @@ impl Engine {
     pub fn prune_daily(&mut self, now: DateTime<Utc>) {
         let cutoff = self.config.date_key(now - chrono::Duration::days(DAILY_KEEP_DAYS));
         self.state.daily.retain(|day, _| day.as_str() >= cutoff.as_str());
+        self.state.daily_users.retain(|day, _| day.as_str() >= cutoff.as_str());
     }
 }
