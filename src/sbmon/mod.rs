@@ -55,8 +55,9 @@ struct AgentBinaries;
 pub struct Sbmon {
     engine: Mutex<Engine>,
     /// Reports changed the state since it was last written. Reports arrive every
-    /// five seconds per node and mostly move counters, so they are saved with
-    /// the next ten-second tick; alerts and user events are saved at once.
+    /// five seconds per node and mostly move counters, so they are saved once a
+    /// minute; alerts and user events are saved at once. Counters lost to a
+    /// crash in between cost nothing: the next report's totals cover the gap.
     dirty: AtomicBool,
     dir: PathBuf,
     flushing: AtomicBool,
@@ -117,6 +118,14 @@ impl Sbmon {
         }
     }
 
+    /// Writes the state if reports changed it since the last save; called on shutdown.
+    pub fn save(&self) {
+        if self.dirty.load(Ordering::Acquire) {
+            let mut engine = self.lock();
+            self.persist(&mut engine);
+        }
+    }
+
     fn history_file(&self, node_id: &str, day: &str) -> PathBuf {
         self.dir.join("history").join(node_id).join(format!("{day}.jsonl"))
     }
@@ -146,7 +155,7 @@ pub async fn run(app: Shared) {
             let mut engine = sb.lock();
             let before = engine.notable;
             let changed = engine.check_offline(now) | engine.check_status(now, &offline);
-            if changed || sb.dirty.load(Ordering::Acquire) {
+            if changed || (ticks.is_multiple_of(6) && sb.dirty.load(Ordering::Acquire)) {
                 sb.persist(&mut engine);
             }
             engine.notable != before
@@ -200,8 +209,15 @@ fn cleanup_history(sb: &Sbmon, now: chrono::DateTime<Utc>) {
         engine.config.history_days
     };
     let cutoff = (now - chrono::Duration::days(keep as i64)).format("%Y-%m-%d").to_string();
+    let known: std::collections::HashSet<String> = sb.lock().state.nodes.keys().cloned().collect();
     let Ok(nodes) = std::fs::read_dir(sb.dir.join("history")) else { return };
     for node in nodes.flatten() {
+        // A node deleted while the hub was down, or one that never came across
+        // from Komari, leaves its directory behind.
+        if !known.contains(node.file_name().to_string_lossy().as_ref()) {
+            let _ = std::fs::remove_dir_all(node.path());
+            continue;
+        }
         let Ok(files) = std::fs::read_dir(node.path()) else { continue };
         for file in files.flatten() {
             let name = file.file_name().to_string_lossy().into_owned();
