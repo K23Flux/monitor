@@ -4,6 +4,10 @@
 #   curl -fsSL https://hub.example.com/install.sh | sh -s -- --server URL --register KEY [options]
 #   curl -fsSL https://hub.example.com/install.sh | sh -s -- --upgrade
 #   curl -fsSL https://hub.example.com/install.sh | sh -s -- --uninstall
+#
+# K23Flux fork: where /etc/sing-box/config.json exists, the sing-box monitor's
+# sb-agent is installed alongside and registered with this node's token, so one
+# command covers both; --no-singbox skips it. See sbmon/README.md.
 set -eu
 # useradd and rc-update reside in sbin, which a root shell entered through `su`
 # without `-` lacks on Debian: su keeps the caller's PATH unless ALWAYS_SET_PATH
@@ -28,6 +32,8 @@ INTERVAL=""
 INSECURE=""
 UNINSTALL=""
 UPGRADE=""
+NO_SINGBOX=""
+SB_CONFIG="/etc/sing-box/config.json"
 
 while [ $# -gt 0 ]; do
 	# A flag with no argument: under set -u, `$2` aborts with the shell's own
@@ -46,6 +52,7 @@ while [ $# -gt 0 ]; do
 	--insecure) INSECURE=1; shift ;;
 	--uninstall) UNINSTALL=1; shift ;;
 	--upgrade) UPGRADE=1; shift ;;
+	--no-singbox) NO_SINGBOX=1; shift ;;
 	*) echo "unknown option: $1" >&2; exit 2 ;;
 	esac
 done
@@ -67,6 +74,14 @@ if [ -n "$UNINSTALL" ]; then
 	userdel monitor-agent 2>/dev/null || deluser monitor-agent 2>/dev/null || true
 	rmdir "$ROOT" 2>/dev/null || true
 	echo "monitor-agent uninstalled"
+	# The sing-box monitor installed with it. Its config and counters stay in
+	# /etc/sb-agent and /var/lib/sb-agent, as its own uninstaller leaves them.
+	if [ -f /etc/systemd/system/sb-agent.service ] || [ -f /usr/local/bin/sb-agent ]; then
+		systemctl disable --now sb-agent 2>/dev/null || true
+		rm -f /etc/systemd/system/sb-agent.service /usr/local/bin/sb-agent
+		systemctl daemon-reload 2>/dev/null || true
+		echo "sb-agent uninstalled (its config stays in /etc/sb-agent)"
+	fi
 	exit 0
 fi
 
@@ -89,7 +104,7 @@ if [ -n "$UPGRADE" ]; then
 fi
 
 [ -n "$SERVER" ] && { [ -n "$TOKEN" ] || [ -n "$REGISTER" ]; } || {
-	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--insecure]" >&2
+	echo "usage: install.sh --server URL (--token TOKEN | --register KEY) [--interval SECONDS] [--iface LIST] [--insecure] [--no-singbox]" >&2
 	echo "       install.sh --upgrade [--iface LIST] [--interval SECONDS]" >&2
 	echo "       install.sh --uninstall" >&2
 	echo "--name NAME names the node --register creates; the hostname otherwise. < > \" ' are dropped from it; the panel renames a node freely" >&2
@@ -207,6 +222,38 @@ else
 	echo "this installer needs systemd or OpenRC" >&2
 	exit 1
 fi
+
+# The sing-box monitor, where this machine runs sing-box. Its own installer is
+# served by the hub and does the work; it is handed this node's token, which the
+# hub accepts in place of a one-time key and ties the two together. A failure
+# here is reported but does not fail the install: the monitor agent above is
+# already running.
+singbox_monitor() {
+	[ -z "$NO_SINGBOX" ] || return 0
+	[ -f "$SB_CONFIG" ] || return 0
+	if [ "$INIT" != systemd ] || ! command -v bash >/dev/null || ! command -v journalctl >/dev/null; then
+		echo "sing-box found, but its monitor needs systemd, journalctl and bash; skipped" >&2
+		return 0
+	fi
+	echo "sing-box found: installing the sing-box monitor (sb-agent)"
+	SB_HELD=$(sed -n 's/.*"server": *"\([^"]*\)".*/\1/p' /etc/sb-agent/config.json 2>/dev/null | head -n 1)
+	if [ -n "$SB_HELD" ] && [ "${SB_HELD%/}" = "${SERVER%/}" ]; then
+		# Already reporting here: upgrade the binary, keep its identity.
+		set -- --update --server "$SERVER"
+	else
+		if [ -f /etc/sb-agent/config.json ]; then
+			# Registered with another hub: that identity means nothing here.
+			mv /etc/sb-agent/config.json "/etc/sb-agent/config.json.bak-$(date +%Y%m%d%H%M%S)"
+			echo "sb-agent was registered with ${SB_HELD:-another hub}; its config is kept beside it as a backup"
+		fi
+		set -- --server "$SERVER" --token "$TOKEN" --name "$(hostname)"
+	fi
+	if curl -fsSL --max-time 60 "${SERVER%/}/api/sbmonitor/v1/install.sh" | bash -s -- "$@"; then
+		return 0
+	fi
+	echo "warning: the sing-box monitor was not installed; monitor-agent itself is fine." >&2
+	echo "         rerun this command to retry, or add --no-singbox to skip it" >&2
+}
 
 # Alpine ships BusyBox adduser rather than useradd: -S system, -D no password,
 # -H no home.
@@ -462,3 +509,4 @@ sleep 3
 systemctl is-active --quiet monitor-agent || not_started "journalctl -u monitor-agent -n 20"
 rm -f "$BIN.old"
 echo "monitor-agent installed; follow it with: journalctl -u monitor-agent -f"
+singbox_monitor

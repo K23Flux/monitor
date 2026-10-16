@@ -14,7 +14,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { api } from "@/lib/api"
+import { api, type Node as HubNode } from "@/lib/api"
 import { bytes } from "@/lib/format"
 
 const SB = "/sbmonitor/v1/admin"
@@ -42,6 +42,7 @@ type SbNode = {
   online: boolean
   singbox: { running: boolean; version: string }
   ports: Port[]
+  hubNodeId: number | null
 }
 type SbEvent = { id: string; nodeName: string; time: string; level: string; message: string }
 type SbState = {
@@ -179,9 +180,10 @@ function AddNodeDialog({ onClose, onDone }: { onClose: () => void; onDone: () =>
     <Dialog open onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="sm:max-w-xl">
         <DialogHeader>
-          <DialogTitle>添加 sing-box 节点</DialogTitle>
+          <DialogTitle>单独安装 sing-box 监控</DialogTitle>
           <DialogDescription>
-            {"生成一条 10 分钟内有效、只能用一次的安装命令，在落地机上以 root 执行。sb-agent 读 /etc/sing-box/config.json 和 sing-box 的日志，不改 sing-box 的配置。"}
+            {"一般不用这里：在「节点」页添加机器时，安装命令发现 /etc/sing-box/config.json 就会顺带装上 sing-box 监控。" +
+              "这里给只想装 sing-box 监控、不装整机探针的机器用：生成一条 10 分钟内有效、只能用一次的命令，以 root 执行。"}
           </DialogDescription>
         </DialogHeader>
         {command ? (
@@ -307,7 +309,32 @@ function HistoryDialog({ node, port, onClose }: { node: SbNode; port: Port; onCl
   )
 }
 
-export function SingBox() {
+/** Ties a node registered on its own to one in the hub's node list. */
+function LinkSelect({ node, hubNodes, onDone }: { node: SbNode; hubNodes: HubNode[]; onDone: () => void }) {
+  return (
+    <select
+      className="h-8 rounded-md border bg-transparent px-2 text-xs"
+      value=""
+      title="关联后名字跟着「节点」页走，删掉节点时一起删"
+      onChange={async (e) => {
+        const id = Number(e.target.value)
+        if (!id) return
+        try {
+          await post("/node/link", { node_id: node.id, hub_node_id: id })
+          toast.success("已关联")
+          onDone()
+        } catch (err) {
+          toast.error((err as Error).message)
+        }
+      }}
+    >
+      <option value="">关联到节点…</option>
+      {hubNodes.map((n) => <option key={n.id} value={n.id}>{n.name}</option>)}
+    </select>
+  )
+}
+
+export function SingBox({ hubNodes }: { hubNodes: HubNode[] }) {
   const { data, error, reload } = usePoll<SbState>(`${SB}/state`)
   const [adding, setAdding] = useState(false)
   const [renaming, setRenaming] = useState<SbNode | null>(null)
@@ -337,7 +364,7 @@ export function SingBox() {
         </div>
         <div className="flex gap-2">
           <Button variant="outline" size="sm" onClick={reload}><RefreshCw className="size-4" /> 刷新</Button>
-          <Button size="sm" onClick={() => setAdding(true)}><Plus className="size-4" /> 添加节点</Button>
+          <Button size="sm" variant="outline" onClick={() => setAdding(true)}><Plus className="size-4" /> 单独安装</Button>
         </div>
       </div>
       {error && <p className="text-sm text-destructive">{error}</p>}
@@ -353,7 +380,9 @@ export function SingBox() {
       </div>
 
       {data.nodes.length === 0 && (
-        <Card className="p-8 text-center text-sm text-muted-foreground">还没有节点。点右上角「添加节点」生成安装命令。</Card>
+        <Card className="p-8 text-center text-sm text-muted-foreground">
+          {"还没有机器。在「节点」页添加机器，跑过安装命令的机器只要有 /etc/sing-box/config.json 就会出现在这里；已经装过探针的机器再跑一次安装命令即可。"}
+        </Card>
       )}
 
       {data.nodes.map((node) => (
@@ -370,7 +399,14 @@ export function SingBox() {
               </div>
             </div>
             <div className="flex gap-1">
-              <Button variant="ghost" size="sm" onClick={() => setRenaming(node)}><Pencil className="size-4" /> 改名</Button>
+              {node.hubNodeId != null ? (
+                <Badge variant="secondary" title="名字跟着「节点」页走">随探针安装</Badge>
+              ) : (
+                <>
+                  <LinkSelect node={node} hubNodes={hubNodes.filter((h) => !data.nodes.some((n) => n.hubNodeId === h.id))} onDone={reload} />
+                  <Button variant="ghost" size="sm" onClick={() => setRenaming(node)}><Pencil className="size-4" /> 改名</Button>
+                </>
+              )}
               <Button variant="ghost" size="sm" className="text-destructive" onClick={() => setDeleting(node)}><Trash2 className="size-4" /> 删除</Button>
             </div>
           </div>
@@ -524,6 +560,73 @@ function EventRow({ event }: { event: UserEvent }) {
   )
 }
 
+type Detected = { tag: string; users: string[]; type: string; nodes: string[] }
+
+/** Watch rules as `tag → label`, in the order written. */
+function parseRules(raw: string): [string, string][] {
+  const out: [string, string][] = []
+  for (const piece of raw.split(/[,\n]/)) {
+    const t = piece.trim()
+    if (!t) continue
+    const i = t.indexOf("=")
+    const tag = (i >= 0 ? t.slice(0, i) : t).trim()
+    if (tag && !out.some(([x]) => x === tag)) out.push([tag, (i >= 0 ? t.slice(i + 1) : tag).trim() || tag])
+  }
+  return out
+}
+
+/**
+ * Every inbound the sb-agents report, with the users sing-box lists for it. A
+ * click watches the tag under its first user's name, or stops watching it. An
+ * inbound shared by several users cannot single one out: the agent sees
+ * connections per inbound, so such a tag reports whoever of them connects.
+ */
+function DetectedInbounds({ rules, onChange }: { rules: string; onChange: (v: string) => void }) {
+  const [found, setFound] = useState<Detected[] | null>(null)
+  useEffect(() => {
+    api<SbState>(`${SB}/state`).then((st) => {
+      const map = new Map<string, Detected>()
+      for (const n of st.nodes) {
+        for (const p of n.ports) {
+          if (!p.tag) continue
+          const d = map.get(p.tag) ?? { tag: p.tag, users: [], type: p.type, nodes: [] }
+          for (const u of p.users) if (!d.users.includes(u)) d.users.push(u)
+          if (!d.nodes.includes(n.name)) d.nodes.push(n.name)
+          map.set(p.tag, d)
+        }
+      }
+      setFound([...map.values()].sort((a, b) => a.tag.localeCompare(b.tag)))
+    }).catch(() => setFound([]))
+  }, [])
+  if (!found?.length) return null
+  const current = parseRules(rules)
+  const toggle = (d: Detected) => {
+    const next = current.some(([t]) => t === d.tag)
+      ? current.filter(([t]) => t !== d.tag)
+      : [...current, [d.tag, d.users[0] || d.tag] as [string, string]]
+    onChange(next.map(([t, l]) => `${t}=${l}`).join("\n"))
+  }
+  return (
+    <div className="flex flex-wrap gap-1.5 pt-1">
+      {found.map((d) => {
+        const on = current.some(([t]) => t === d.tag)
+        return (
+          <button
+            key={d.tag}
+            type="button"
+            onClick={() => toggle(d)}
+            title={`${d.type} · ${d.nodes.join("、")}${d.users.length > 1 ? " · 多个用户共用，按入站统计" : ""}`}
+            className={`rounded-md border px-2 py-1 text-left text-xs transition-colors ${on ? "border-foreground bg-secondary" : "text-muted-foreground hover:bg-muted"}`}
+          >
+            <span className="font-mono">{d.tag}</span>
+            <span className="ml-1.5">{d.users.length ? d.users.join(", ") : "无用户名"}</span>
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
 function WatchSettings({ onSaved }: { onSaved: () => void }) {
   const [form, setForm] = useState<Record<string, string> | null>(null)
   const [tokenSet, setTokenSet] = useState(false)
@@ -590,7 +693,8 @@ function WatchSettings({ onSaved }: { onSaved: () => void }) {
           placeholder={"ss2022_alice=alice\nhy2_alice=alice"}
           onChange={(e) => set("watch_rules", e.target.value)}
         />
-        <p className="text-xs text-muted-foreground">一行或逗号分隔一条，格式「入站 tag=显示名」。按 tag 匹配，所有节点上同名的入站都算。</p>
+        <p className="text-xs text-muted-foreground">一行或逗号分隔一条，格式「入站 tag=显示名」。按 tag 匹配，所有节点上同名的入站都算。也可以直接点下面探测到的入站。</p>
+        <DetectedInbounds rules={form.watch_rules ?? ""} onChange={(v) => set("watch_rules", v)} />
       </div>
       <div className="grid gap-4 sm:grid-cols-2">
         <div className="space-y-1.5">

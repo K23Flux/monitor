@@ -20,7 +20,7 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use axum::body::Bytes;
-use axum::extract::{Path as UrlPath, Query, State};
+use axum::extract::{ConnectInfo, Path as UrlPath, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -147,6 +147,7 @@ pub async fn run(app: Shared) {
             sb.wake.notify_one();
         }
         if ticks.is_multiple_of(6) {
+            sync_hub(&app);
             let (lines, day) = {
                 let engine = sb.lock();
                 (engine.history_lines(now), engine.config.date_key(now))
@@ -280,17 +281,68 @@ fn bearer(headers: &HeaderMap) -> String {
     }
 }
 
-async fn agent_register(State(app): State<Shared>, body: Bytes) -> Response {
+/// The hub node a token belongs to, with its name. The hub's `install.sh`
+/// registers sb-agent with the node token it already holds, so installing the
+/// monitor agent on a machine running sing-box sets up both in one command.
+fn hub_node(app: &App, token: &str) -> Option<(i64, String)> {
+    if token.len() < 16 {
+        return None;
+    }
+    let id = app.db.node_by_token(token).ok()??;
+    let name = app.db.node(id).ok()?.map(|n| n.name).unwrap_or_default();
+    Some((id, name))
+}
+
+async fn agent_register(
+    State(app): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let Some(body) = json_body(&body) else { return agent_fail(400, "请求内容不是有效 JSON") };
+    // Counted with the hub's own agent registrations: a node token is a
+    // credential, and this route must not become a way to guess one.
+    let ip = crate::auth::client_ip(&app, &headers, peer.ip());
+    if app.registrations.locked(ip) {
+        return agent_fail(429, "尝试次数过多，稍后再试");
+    }
+    let token = body.get("registration_token").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let linked = hub_node(&app, &token);
     let sb = &app.sbmon;
     let mut engine = sb.lock();
-    match engine.register(&body, Utc::now()) {
+    let result = match linked {
+        Some((hub_id, hub_name)) => Ok(engine.register_linked(hub_id, &hub_name, &body, Utc::now())),
+        None => engine.register(&body, Utc::now()),
+    };
+    match result {
         Ok(value) => {
+            app.registrations.clear(ip);
             sb.persist(&mut engine);
             info!("sing-box agent registered: {}", value["name"].as_str().unwrap_or_default());
             agent_json(200, value)
         }
-        Err(engine::Refusal(status, message)) => agent_fail(status, message),
+        Err(engine::Refusal(status, message)) => {
+            if status == 401 {
+                app.registrations.record_failure(ip);
+            }
+            agent_fail(status, message)
+        }
+    }
+}
+
+/// Brings linked nodes in line with the hub's node list; see `Engine::sync_hub_nodes`.
+fn sync_hub(app: &App) {
+    let names = match app.db.nodes() {
+        Ok(nodes) => nodes.into_iter().map(|n| (n.id, n.name)).collect(),
+        Err(e) => {
+            warn!("reading the node list for sing-box monitor failed: {e:#}");
+            return;
+        }
+    };
+    let sb = &app.sbmon;
+    let mut engine = sb.lock();
+    if engine.sync_hub_nodes(&names) {
+        sb.persist(&mut engine);
     }
 }
 
@@ -369,6 +421,7 @@ fn private(value: Value) -> Response {
 }
 
 async fn admin_state(_: Admin, State(app): State<Shared>) -> Response {
+    sync_hub(&app);
     private(app.sbmon.lock().admin_state(Utc::now()))
 }
 
@@ -418,6 +471,24 @@ async fn rename_node(_: Admin, State(app): State<Shared>, Json(body): Json<NodeB
 
 async fn set_alias(_: Admin, State(app): State<Shared>, Json(body): Json<NodeBody>) -> Response {
     edit(&app, |e| e.set_alias(&body.node_id, &body.port, &body.alias))
+}
+
+#[derive(Deserialize)]
+struct LinkBody {
+    node_id: String,
+    hub_node_id: Option<i64>,
+}
+
+async fn link_node(_: Admin, State(app): State<Shared>, Json(body): Json<LinkBody>) -> Response {
+    let hub = match body.hub_node_id {
+        Some(id) => match app.db.node(id) {
+            Ok(Some(n)) => Some((id, n.name)),
+            Ok(None) => return answer(StatusCode::NOT_FOUND, "节点不存在，可能已被删除"),
+            Err(e) => return crate::api::fail(e),
+        },
+        None => None,
+    };
+    edit(&app, |e| e.link_node(&body.node_id, hub.as_ref().map(|(id, name)| (*id, name.as_str()))))
 }
 
 async fn delete_node(_: Admin, State(app): State<Shared>, Json(body): Json<NodeBody>) -> Response {
@@ -571,6 +642,7 @@ pub fn admin_routes() -> Router<Shared> {
         .route(&format!("{API}/admin/node/rename"), post(rename_node))
         .route(&format!("{API}/admin/node/alias"), post(set_alias))
         .route(&format!("{API}/admin/node/delete"), post(delete_node))
+        .route(&format!("{API}/admin/node/link"), post(link_node))
         .route(&format!("{API}/admin/telegram/test"), post(test_telegram))
 }
 

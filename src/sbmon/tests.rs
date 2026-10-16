@@ -314,3 +314,54 @@ fn deleting_a_node_drops_its_traces() {
     );
     assert!(e.delete_node(&node).is_err());
 }
+
+#[test]
+fn an_agent_installed_with_the_hub_node_is_linked_and_reinstalls_in_place() {
+    let mut e = Engine::new(State::default(), config("ss2022_alice=alice"));
+    let body = json!({"registration_token": "node-token", "hostname": "jp", "arch": "amd64", "agent_version": "0.3.2"});
+    let first = e.register_linked(7, "JP", &body, t0());
+    let id = first["node_id"].as_str().unwrap().to_owned();
+    assert_eq!(e.state.nodes[&id].hub_node_id, Some(7));
+    assert_eq!(e.state.nodes[&id].name, "JP");
+    // A reinstall keeps the sb node and replaces its token.
+    let second = e.register_linked(7, "JP", &body, t0());
+    assert_eq!(second["node_id"], first["node_id"]);
+    assert_eq!(e.state.nodes.len(), 1);
+    let old = first["agent_token"].as_str().unwrap();
+    let new = second["agent_token"].as_str().unwrap();
+    assert_eq!(e.report(old, &report(&id, json!({})), t0()).unwrap_err().0, 401);
+    e.report(new, &report(&id, json!({})), t0()).unwrap();
+    // Linked nodes are renamed in the node list, not here.
+    assert!(e.rename_node(&id, "x").is_err());
+}
+
+#[test]
+fn linked_nodes_follow_the_hubs_node_list() {
+    let mut e = Engine::new(State::default(), Config::default());
+    let id = e.register_linked(7, "JP", &json!({}), t0())["node_id"].as_str().unwrap().to_owned();
+    let key = e.create_registration("own", t0()).unwrap()["token"].as_str().unwrap().to_owned();
+    let own = e.register(&json!({"registration_token": key}), t0()).unwrap()["node_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut names = std::collections::BTreeMap::from([(7, "Tokyo".to_owned())]);
+    assert!(e.sync_hub_nodes(&names));
+    assert_eq!(e.state.nodes[&id].name, "Tokyo");
+    assert!(!e.sync_hub_nodes(&names), "nothing left to change");
+    names.clear();
+    assert!(e.sync_hub_nodes(&names));
+    assert!(!e.state.nodes.contains_key(&id), "deleted with its hub node");
+    assert!(e.state.nodes.contains_key(&own), "a node registered on its own stays");
+}
+
+#[test]
+fn an_existing_node_can_be_linked_by_hand() {
+    let (mut e, node, _) = registered("");
+    e.link_node(&node, Some((3, "Node HK"))).unwrap();
+    assert_eq!(e.state.nodes[&node].hub_node_id, Some(3));
+    assert_eq!(e.state.nodes[&node].name, "Node HK");
+    let other = e.register_linked(4, "DE", &json!({}), t0())["node_id"].as_str().unwrap().to_owned();
+    assert!(e.link_node(&other, Some((3, "Node HK"))).is_err(), "one sing-box per hub node");
+    e.link_node(&node, None).unwrap();
+    assert_eq!(e.state.nodes[&node].hub_node_id, None);
+}

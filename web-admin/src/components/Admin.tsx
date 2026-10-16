@@ -1356,6 +1356,9 @@ function RegisterDialog({ site, reg, onClose }: {
               <Command className={`max-h-40 min-h-24 ${command ? "" : "text-muted-foreground"}`}>
                 {command || "网卡名有误，改正后显示命令"}
               </Command>
+              <p className="text-xs text-muted-foreground">
+                {"装了 sing-box（有 /etc/sing-box/config.json）的机器会顺带装上 sing-box 监控；不需要就加 --no-singbox。"}
+              </p>
               {/* Per machine, so it cannot be part of the one command. */}
               <p className="text-xs leading-relaxed text-muted-foreground">
                 要给某台单独起名，在它执行的命令末尾加 <code>--name 名字</code>，只对新建的节点生效。
@@ -1550,6 +1553,9 @@ function InstallDialog({ node, site, onClose, onRotated }: {
             <Command className={`max-h-40 min-h-24 ${command ? "" : "text-muted-foreground"}`}>
               {command || placeholder}
             </Command>
+            <p className="text-xs text-muted-foreground">
+              {"机器上有 /etc/sing-box/config.json 时会顺带装上 sing-box 监控，入站和用户自动识别；不需要就在命令末尾加 --no-singbox。"}
+            </p>
           </section>
           <OptionRow title="换发凭证" hint="旧凭证立即作废，agent 掉线，需用新命令重装">
             <Button variant="outline" size="sm" disabled={rotating} onClick={() => setConfirmRotate(true)}>
@@ -3747,7 +3753,7 @@ export function Admin({
         {path === "/admin/ping" ? (
           <Ping nodes={nodes} />
         ) : path === "/admin/singbox" ? (
-          <SingBox />
+          <SingBox hubNodes={nodes} />
         ) : path === "/admin/watch" ? (
           <ConnWatch />
         ) : path === "/admin/notify" ? (
