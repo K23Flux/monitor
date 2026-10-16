@@ -19,6 +19,15 @@ K23Flux/monitor 在上游 [monitor-probe/monitor](https://github.com/monitor-pro
 
 单独装 sing-box 监控（不装整机探针）仍可以在「sing-box」页点「单独安装」生成一次性命令。原来从 Komari 迁过来的 sb-agent 也是这种，可以在 sing-box 页用「关联到节点」把它和整机探针的节点对上。
 
+## 每个用户的流量和准确的在连（clash_api）
+
+sing-box 配置里开了只监听本机的 `experimental.clash_api`（如 `"external_controller": "127.0.0.1:19090"` 加 `secret`）时，sb-agent 0.5.0 每秒读一次它的 `/connections`：
+
+- 在连数直接取自 sing-box 打开着的连接，**Hysteria2 / TUIC / mux 也准确**，不再靠「多久没有新连接」猜下线。
+- 每条连接的上下行字节按用户累计。clash_api 本身不给用户名，sb-agent 用日志里 `[用户] inbound connection to` 这一行把连接的来源地址对到用户，所以日志级别要是 `info`。两次上报之间开了又关的短连接也算在内（每秒采一次，最后的字节数留着）。
+- sing-box 页每台服务器下面列出各用户今天和本月的流量，顶部有所有服务器的合计。对不上用户的连接记在「未识别」下。
+- 只用回环地址上的 clash_api，secret 不会离开本机。没开 clash_api 的机器照旧按日志和 `/proc/net/tcp` 判断。
+
 ## 组成
 
 | 位置 | 说明 |

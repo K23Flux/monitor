@@ -443,3 +443,18 @@ fn singbox_stopping_and_agents_going_quiet_are_announced() {
     e.report(&token, &report(&node, json!({})), now + Duration::minutes(8)).unwrap();
     assert!(e.state.pending.last().unwrap().text.contains("恢复上报"));
 }
+
+#[test]
+fn traffic_is_booked_per_user() {
+    let (mut e, node, token) = registered("");
+    let ut = |up: u64, down: u64| json!({"user_traffic": [{"tag": "hy2-in", "user": "jasper", "upload": up, "download": down}, {"tag": "hy2-in", "user": "", "upload": 1, "download": 0}]});
+    e.report(&token, &report(&node, ut(100, 1000)), t0()).unwrap();
+    e.report(&token, &report(&node, ut(50, 500)), t0() + Duration::seconds(5)).unwrap();
+    let users = e.admin_state(t0())["nodes"][0]["users"].clone();
+    assert_eq!(users[0]["user"], "jasper");
+    assert_eq!(users[0]["today"]["total"], 1650.0);
+    assert_eq!(users[0]["month"]["download"], 1500.0);
+    assert_eq!(users[1]["user"], "", "connections nobody could be matched to stay visible");
+    e.delete_node(&node).unwrap();
+    assert!(e.state.daily_users.values().all(|n| n.is_empty()));
+}

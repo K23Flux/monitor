@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -24,12 +25,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
 const (
-	version        = "0.4.0"
+	version        = "0.5.0"
 	configFile     = "/etc/sb-agent/config.json"
 	stateFile      = "/var/lib/sb-agent/state.json"
 	singBoxConfig  = "/etc/sing-box/config.json"
@@ -148,6 +150,17 @@ type Report struct {
 	Counters     []ReportCounter   `json:"counters"`
 	Events       []string          `json:"events,omitempty"`
 	Activity     []InboundActivity `json:"activity,omitempty"`
+	// UserTraffic is bytes per inbound user since the last accepted report,
+	// read from sing-box's clash_api (per connection) and attributed to users
+	// through the log. Empty when the config has no clash_api.
+	UserTraffic []UserTraffic `json:"user_traffic,omitempty"`
+}
+
+type UserTraffic struct {
+	Tag      string `json:"tag"`
+	User     string `json:"user"`
+	Upload   uint64 `json:"upload"`
+	Download uint64 `json:"download"`
 }
 
 type SingboxStatus struct {
@@ -422,6 +435,20 @@ func collectAndReport(cfg *Config, state *AgentState) error {
 		state.LastActivityUnix = activityUnix
 	}
 
+	// With clash_api the live connections are known exactly, QUIC ones
+	// included, and so is each connection's traffic.
+	var userTraffic []UserTraffic
+	if clashAPIFrom(cfg.ConfigPath) != nil {
+		clashUsage.start(cfg.ConfigPath)
+		if live, ok := clashUsage.snapshot(); ok {
+			activity = applyClash(activity, live, inbounds)
+			userTraffic = clashUsage.usage(tracker)
+		} else if err := clashUsage.lastError(); err != nil && !clashWarned {
+			clashWarned = true
+			log.Printf("读取 clash_api 失败（改用日志判断在连）: %v", err)
+		}
+	}
+
 	hostname, _ := os.Hostname()
 	report := Report{
 		NodeID:       cfg.NodeID,
@@ -433,10 +460,11 @@ func collectAndReport(cfg *Config, state *AgentState) error {
 			Running: serviceRunning(cfg.ServiceName),
 			Version: singboxVersion(),
 		},
-		Inbounds: inbounds,
-		Counters: reportCounters(ports, state),
-		Events:   events,
-		Activity: activity,
+		Inbounds:    inbounds,
+		Counters:    reportCounters(ports, state),
+		Events:      events,
+		Activity:    activity,
+		UserTraffic: userTraffic,
 	}
 	var response apiResponse
 	if err := postJSON(cfg.Server+apiPrefix+"/agent/report", cfg.AgentToken, report, &response); err != nil {
@@ -446,6 +474,7 @@ func collectAndReport(cfg *Config, state *AgentState) error {
 		return errors.New(response.Error)
 	}
 	tracker.commit()
+	clashUsage.commit()
 	if state.LastLogUnix == 0 || now.Unix()-state.LastLogUnix >= 30 {
 		state.LastLogUnix = now.Unix() - 1
 	}
@@ -815,13 +844,26 @@ type connTracker struct {
 	acc        map[string]*tagAccumulator
 	cursor     string
 	backfilled bool
+	// peerOf maps a log connection id to the client address its "from" line
+	// named, for every kind of connection; userOfPeer maps tag|address to the
+	// user its "to" line named. Together they tell whose a clash_api
+	// connection is, since clash_api reports addresses but not users.
+	peerOf     map[string]string
+	userOfPeer map[string]peerUser
+}
+
+type peerUser struct {
+	user string
+	seen int64
 }
 
 func newConnTracker() *connTracker {
 	return &connTracker{
-		conns: map[string]*trackedConn{},
-		byID:  map[string]*trackedConn{},
-		acc:   map[string]*tagAccumulator{},
+		conns:      map[string]*trackedConn{},
+		byID:       map[string]*trackedConn{},
+		acc:        map[string]*tagAccumulator{},
+		peerOf:     map[string]string{},
+		userOfPeer: map[string]peerUser{},
 	}
 }
 
@@ -878,11 +920,39 @@ func parseJournalLine(raw string) (ts int64, id, tag, kind, dir, peer string, ok
 	return int64(stamp), match[1], match[2], strings.TrimSpace(match[3]), match[4], match[5], true
 }
 
+var userLineRe = regexp.MustCompile(`\[(\d+) [^\]]*\] inbound/[a-zA-Z0-9_]+\[([a-zA-Z0-9_.\-]+)\]: \[([^\]]+)\] inbound (?:multiplex |packet )?connection to `)
+
+// noteUser records whose connection a "to" line belongs to, when sing-box
+// named the user on it (inbounds with users do).
+func (t *connTracker) noteUser(raw string, ts int64) {
+	m := userLineRe.FindStringSubmatch(ansiRe.ReplaceAllString(raw, ""))
+	if m == nil {
+		return
+	}
+	peer, ok := t.peerOf[m[1]]
+	if !ok {
+		return
+	}
+	delete(t.peerOf, m[1])
+	t.userOfPeer[m[2]+"|"+peer] = peerUser{user: m[3], seen: ts}
+	if len(t.userOfPeer) > 20000 {
+		for key, v := range t.userOfPeer {
+			if ts-v.seen > 86400 {
+				delete(t.userOfPeer, key)
+			}
+		}
+	}
+}
+
 // handleLine feeds one parsed connection line into the tracker. record=false is
 // used when rebuilding the connection table after an agent restart: the
 // connections are learned, but nothing is reported as new activity.
 func (t *connTracker) handleLine(ts int64, id, tag, kind, dir, peer string, record bool) {
 	if dir == "from" {
+		if len(t.peerOf) > 50000 {
+			t.peerOf = map[string]string{}
+		}
+		t.peerOf[id] = peer
 		if kind == "" {
 			key := tag + "|" + peer
 			if old := t.conns[key]; old != nil {
@@ -1061,6 +1131,7 @@ func collectInboundActivity(service string, sinceUnix int64, inbounds []Inbound)
 			_, _ = scanJournal(service, []string{"--since", "@" + strconv.FormatInt(now-backfillSeconds, 10)}, func(raw string) {
 				if ts, id, tag, kind, dir, peer, ok := parseJournalLine(raw); ok && tags[tag] {
 					t.handleLine(ts, id, tag, kind, dir, peer, false)
+					t.noteUser(raw, ts)
 				}
 			})
 		}
@@ -1080,6 +1151,7 @@ func collectInboundActivity(service string, sinceUnix int64, inbounds []Inbound)
 	cursor, err := scanJournal(service, extra, func(raw string) {
 		if ts, id, tag, kind, dir, peer, ok := parseJournalLine(raw); ok && tags[tag] {
 			t.handleLine(ts, id, tag, kind, dir, peer, true)
+			t.noteUser(raw, ts)
 		}
 	})
 	nextSince := now
@@ -1154,6 +1226,7 @@ func collectInboundActivityFromLines(lines []string, inbounds []Inbound, now int
 	for _, raw := range lines {
 		if ts, id, tag, kind, dir, peer, ok := parseLogFileLine(raw, now); ok && tags[tag] {
 			t.handleLine(ts, id, tag, kind, dir, peer, true)
+			t.noteUser(raw, ts)
 		}
 	}
 	established, procOK := readEstablished(ports)
@@ -1335,4 +1408,277 @@ func atomicWriteJSON(filename string, value any, mode os.FileMode) error {
 		return err
 	}
 	return os.Rename(tempName, filename)
+}
+
+// ---- clash_api ------------------------------------------------------------
+
+type clashAPI struct {
+	url    string
+	secret string
+}
+
+var clashWarned bool
+
+var clashHTTP = &http.Client{Timeout: 3 * time.Second}
+
+// clashAPIFrom reads experimental.clash_api from the sing-box config. Only a
+// controller on a loopback address is used: the agent never sends its secret
+// off the machine.
+func clashAPIFrom(configPath string) *clashAPI {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil
+	}
+	var root struct {
+		Experimental struct {
+			ClashAPI struct {
+				Controller string `json:"external_controller"`
+				Secret     string `json:"secret"`
+			} `json:"clash_api"`
+		} `json:"experimental"`
+	}
+	if json.Unmarshal(data, &root) != nil {
+		return nil
+	}
+	controller := strings.TrimSpace(root.Experimental.ClashAPI.Controller)
+	host, port, err := net.SplitHostPort(controller)
+	if err != nil || port == "" {
+		return nil
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	if addr, err := netip.ParseAddr(host); host != "localhost" && (err != nil || !addr.IsLoopback()) {
+		return nil
+	}
+	return &clashAPI{url: "http://" + net.JoinHostPort(host, port), secret: root.Experimental.ClashAPI.Secret}
+}
+
+type clashConn struct {
+	ID       string `json:"id"`
+	Upload   uint64 `json:"upload"`
+	Download uint64 `json:"download"`
+	Metadata struct {
+		Type       string `json:"type"`
+		SourceIP   string `json:"sourceIP"`
+		SourcePort string `json:"sourcePort"`
+		Host       string `json:"host"`
+		DestIP     string `json:"destinationIP"`
+	} `json:"metadata"`
+}
+
+// tag is the inbound tag from "type/tag".
+func (c clashConn) tag() string {
+	if i := strings.Index(c.Metadata.Type, "/"); i >= 0 {
+		return c.Metadata.Type[i+1:]
+	}
+	return ""
+}
+
+// peer is the client address in the form the log writes it.
+func (c clashConn) peer() string {
+	return net.JoinHostPort(c.Metadata.SourceIP, c.Metadata.SourcePort)
+}
+
+func (c clashConn) destination() string {
+	if c.Metadata.Host != "" {
+		return c.Metadata.Host
+	}
+	return c.Metadata.DestIP
+}
+
+func (a *clashAPI) connections() ([]clashConn, error) {
+	request, err := http.NewRequest(http.MethodGet, a.url+"/connections", nil)
+	if err != nil {
+		return nil, err
+	}
+	if a.secret != "" {
+		request.Header.Set("Authorization", "Bearer "+a.secret)
+	}
+	response, err := clashHTTP.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", response.StatusCode)
+	}
+	var body struct {
+		Connections []clashConn `json:"connections"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 32<<20)).Decode(&body); err != nil {
+		return nil, err
+	}
+	return body.Connections, nil
+}
+
+// applyClash replaces the live counts with clash_api's open connections and
+// marks every inbound as live-tracked, QUIC included.
+func applyClash(activity []InboundActivity, live map[string]int, inbounds []Inbound) []InboundActivity {
+	index := map[string]int{}
+	for i, entry := range activity {
+		index[entry.Tag] = i
+	}
+	now := time.Now().Unix()
+	for _, inbound := range inbounds {
+		if inbound.Tag == "" {
+			continue
+		}
+		if i, ok := index[inbound.Tag]; ok {
+			activity[i].Live = live[inbound.Tag]
+			activity[i].LiveTracked = true
+		} else if live[inbound.Tag] > 0 {
+			activity = append(activity, InboundActivity{Tag: inbound.Tag, LastActiveUnix: now, Live: live[inbound.Tag], LiveTracked: true})
+			index[inbound.Tag] = len(activity) - 1
+		}
+	}
+	sort.Slice(activity, func(i, j int) bool { return activity[i].Tag < activity[j].Tag })
+	return activity
+}
+
+// clashWatch follows clash_api once a second in the background, so that a
+// connection opened and closed between two reports still has its final byte
+// counts. Bytes are attributed to users at report time, after the log scan
+// has learned whose connection each was.
+type clashWatch struct {
+	mu      sync.Mutex
+	open    map[string]*watchedConn
+	closed  []*watchedConn
+	seeded  bool
+	err     error
+	pending map[string]*UserTraffic
+}
+
+type watchedConn struct {
+	tag, peer, dest string
+	cur, done       [2]uint64 // done: already handed to a report
+}
+
+var clashUsage = &clashWatch{open: map[string]*watchedConn{}, pending: map[string]*UserTraffic{}}
+
+var clashOnce sync.Once
+
+// start launches the poller once; it follows whatever clash_api the config
+// names at each poll, so a config change needs no agent restart.
+func (w *clashWatch) start(configPath string) {
+	clashOnce.Do(func() {
+		go func() {
+			for {
+				if api := clashAPIFrom(configPath); api != nil {
+					conns, err := api.connections()
+					w.update(conns, err)
+				}
+				time.Sleep(time.Second)
+			}
+		}()
+	})
+}
+
+func (w *clashWatch) update(conns []clashConn, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.err = err
+	if err != nil {
+		return
+	}
+	seen := make(map[string]bool, len(conns))
+	for _, c := range conns {
+		tag := c.tag()
+		if tag == "" {
+			continue
+		}
+		seen[c.ID] = true
+		cur := [2]uint64{c.Upload, c.Download}
+		entry := w.open[c.ID]
+		if entry == nil {
+			entry = &watchedConn{tag: tag, peer: c.peer(), dest: c.destination()}
+			// Connections already open when the agent started carried their
+			// earlier bytes before monitoring (or in the previous run's reports).
+			if !w.seeded {
+				entry.done = cur
+			}
+			w.open[c.ID] = entry
+		}
+		entry.cur = cur
+	}
+	for id, entry := range w.open {
+		if !seen[id] {
+			w.closed = append(w.closed, entry)
+			delete(w.open, id)
+		}
+	}
+	w.seeded = true
+}
+
+// snapshot returns the live connections per tag (real destinations only),
+// and whether clash_api answered at its last poll.
+func (w *clashWatch) snapshot() (map[string]int, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.seeded || w.err != nil {
+		return nil, false
+	}
+	live := map[string]int{}
+	for _, c := range w.open {
+		if !isHealthCheck(hostOnly(c.dest)) {
+			live[c.tag]++
+		}
+	}
+	return live, true
+}
+
+// usage moves every byte not yet reported into the pending per-user totals and
+// returns them; they stay pending until a report carrying them is accepted.
+func (w *clashWatch) usage(t *connTracker) []UserTraffic {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	take := func(c *watchedConn) {
+		var up, down uint64
+		if c.cur[0] > c.done[0] {
+			up = c.cur[0] - c.done[0]
+		}
+		if c.cur[1] > c.done[1] {
+			down = c.cur[1] - c.done[1]
+		}
+		c.done = c.cur
+		if up == 0 && down == 0 {
+			return
+		}
+		user := t.userOfPeer[c.tag+"|"+c.peer].user
+		key := c.tag + "|" + user
+		entry := w.pending[key]
+		if entry == nil {
+			entry = &UserTraffic{Tag: c.tag, User: user}
+			w.pending[key] = entry
+		}
+		entry.Upload += up
+		entry.Download += down
+	}
+	for _, c := range w.open {
+		take(c)
+	}
+	for _, c := range w.closed {
+		take(c)
+	}
+	w.closed = w.closed[:0]
+	result := make([]UserTraffic, 0, len(w.pending))
+	for _, entry := range w.pending {
+		result = append(result, *entry)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Tag+"|"+result[i].User < result[j].Tag+"|"+result[j].User
+	})
+	return result
+}
+
+func (w *clashWatch) lastError() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.err
+}
+
+func (w *clashWatch) commit() {
+	w.mu.Lock()
+	w.pending = map[string]*UserTraffic{}
+	w.mu.Unlock()
 }

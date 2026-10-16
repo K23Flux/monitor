@@ -373,3 +373,71 @@ func TestFileTail(t *testing.T) {
 		t.Fatalf("warnings %q", got)
 	}
 }
+
+func TestClashUsageAttributesTrafficToUsers(t *testing.T) {
+	tr := newConnTracker()
+	feed := func(raw string) {
+		ts, id, tag, kind, dir, peer, ok := parseLogFileLine(raw, 100)
+		if !ok {
+			t.Fatalf("unparsed: %s", raw)
+		}
+		tr.handleLine(ts, id, tag, kind, dir, peer, true)
+		tr.noteUser(raw, ts)
+	}
+	conn := func(id, ip, port string, up, down uint64) clashConn {
+		var c clashConn
+		c.ID, c.Upload, c.Download = id, up, down
+		c.Metadata.Type, c.Metadata.SourceIP, c.Metadata.SourcePort, c.Metadata.Host = "hysteria2/hy2-in", ip, port, "www.example.org"
+		return c
+	}
+	w := &clashWatch{open: map[string]*watchedConn{}, pending: map[string]*UserTraffic{}}
+	// Open before the agent started: its earlier bytes are not counted.
+	w.update([]clashConn{conn("a", "203.0.113.9", "4000", 100, 1000)}, nil)
+	w.update([]clashConn{conn("a", "203.0.113.9", "4000", 150, 1500), conn("b", "2001:db8::1", "5000", 10, 20)}, nil)
+	// "c" opens and closes between two reports; its bytes still count.
+	w.update([]clashConn{conn("a", "203.0.113.9", "4000", 150, 1500), conn("b", "2001:db8::1", "5000", 10, 20), conn("c", "198.51.100.1", "1", 7, 8)}, nil)
+	w.update([]clashConn{conn("a", "203.0.113.9", "4000", 150, 1500)}, nil)
+	if live, ok := w.snapshot(); !ok || live["hy2-in"] != 1 {
+		t.Fatalf("live %v %v", live, ok)
+	}
+	// The log is read at report time, after the connections were seen.
+	feed("INFO [5 0ms] inbound/hysteria2[hy2-in]: inbound connection from 203.0.113.9:4000")
+	feed("INFO [5 0ms] inbound/hysteria2[hy2-in]: [jasper] inbound connection to www.example.org:443")
+	feed("INFO [6 0ms] inbound/hysteria2[hy2-in]: inbound packet connection from [2001:db8::1]:5000")
+	feed("INFO [6 0ms] inbound/hysteria2[hy2-in]: [LF] inbound packet connection to 1.1.1.1:53")
+	got := w.usage(tr)
+	want := []UserTraffic{{"hy2-in", "", 7, 8}, {"hy2-in", "LF", 10, 20}, {"hy2-in", "jasper", 50, 500}}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	// Not accepted yet: the same totals go again, nothing is counted twice.
+	if again := w.usage(tr); fmt.Sprint(again) != fmt.Sprint(want) {
+		t.Fatalf("pending kept: %v", again)
+	}
+	w.commit()
+	if got := w.usage(tr); len(got) != 0 {
+		t.Fatalf("nothing new: %v", got)
+	}
+	act := applyClash(nil, map[string]int{"hy2-in": 1}, []Inbound{{Port: 1, Tag: "hy2-in", Type: "hysteria2", Mux: true}})
+	if len(act) != 1 || act[0].Live != 1 || !act[0].LiveTracked {
+		t.Fatalf("live from clash_api: %+v", act)
+	}
+}
+
+func TestClashAPIFromConfigOnlyLoopback(t *testing.T) {
+	dir := t.TempDir()
+	write := func(controller string) string {
+		p := filepath.Join(dir, "c.json")
+		os.WriteFile(p, []byte(`{"experimental":{"clash_api":{"external_controller":"`+controller+`","secret":"s"}}}`), 0o600)
+		return p
+	}
+	if a := clashAPIFrom(write("127.0.0.1:19090")); a == nil || a.url != "http://127.0.0.1:19090" || a.secret != "s" {
+		t.Fatalf("loopback: %+v", a)
+	}
+	if a := clashAPIFrom(write(":19090")); a == nil || a.url != "http://127.0.0.1:19090" {
+		t.Fatalf("wildcard is reached on loopback: %+v", a)
+	}
+	if a := clashAPIFrom(write("203.0.113.5:19090")); a != nil {
+		t.Fatal("a remote controller is never used")
+	}
+}

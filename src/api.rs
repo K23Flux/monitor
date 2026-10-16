@@ -330,6 +330,14 @@ fn node_view(
         view["country_auto"] = json!(node.country);
         view["remark"] = json!(node.remark);
         view["notify"] = json!(node.notify);
+    } else {
+        // K23Flux fork: what a machine costs and when it runs out stay in the
+        // panel; the public page shows usage only.
+        view["price"] = json!(0);
+        view["currency"] = json!("");
+        view["billing_cycle"] = json!("");
+        view["expires_at"] = Value::Null;
+        view["expires_in"] = Value::Null;
     }
     view
 }
@@ -3196,19 +3204,22 @@ mod tests {
         );
     }
 
-    /// Days to expiry are counted on the hub's calendar and are public, like the
-    /// date itself; no date counts nothing.
+    /// Days to expiry are counted on the hub's calendar; no date counts
+    /// nothing. In this fork the public page sees neither the date nor the days.
     #[test]
     fn days_to_expiry_follow_the_hubs_calendar() {
         let app = app();
         let id = node(&app, "a", true);
-        let expires_in = || visible_nodes(&app, false).unwrap()[0]["expires_in"].clone();
+        let expires_in = || visible_nodes(&app, true).unwrap()[0]["expires_in"].clone();
         assert_eq!(expires_in(), Value::Null);
         let today = Local::now().date_naive();
         for days in [3, 0, -1] {
             app.db.set_expiry(id, &(today + chrono::Duration::days(days)).to_string()).unwrap();
             assert_eq!(expires_in(), json!(days));
         }
+        let public = &visible_nodes(&app, false).unwrap()[0];
+        assert_eq!((public["expires_in"].clone(), public["expires_at"].clone()), (Value::Null, Value::Null));
+        assert_eq!(public["price"], json!(0));
     }
 
     /// A write naming a node that no longer exists, such as one deleted from
