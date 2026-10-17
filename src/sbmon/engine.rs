@@ -339,6 +339,12 @@ pub struct Node {
     /// An alert went out that this sb-agent stopped reporting.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub agent_lost_alerted: bool,
+    /// Last time (ms) the hub saw this machine's own agent disconnected. The
+    /// sb-agent's silence only counts from here, so when the machine, or the
+    /// hub's own network, comes back the sb-agent gets the full grace again.
+    /// Not persisted: after a restart every agent starts disconnected anyway.
+    #[serde(skip)]
+    pub host_down_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -1437,7 +1443,10 @@ impl Engine {
 
     /// sing-box stopped for longer than [`STATUS_GRACE_MS`], and sb-agents silent
     /// for [`AGENT_LOST_ALERT_MS`] while their machine is still up (`hub_offline`
-    /// lists hub nodes whose own agent is down; the hub alerts for those).
+    /// lists hub nodes whose own agent is down; the hub alerts for those). The
+    /// silence is counted from the later of the last report and the last time
+    /// the machine was seen down, so a blip of the hub's own network, which
+    /// drops every agent at once, does not read as sb-agents that stopped.
     /// Returns whether anything changed.
     pub fn check_status(&mut self, now: DateTime<Utc>, hub_offline: &HashSet<i64>) -> bool {
         if !self.config.notify_status {
@@ -1448,11 +1457,12 @@ impl Engine {
         for node in self.state.nodes.values_mut() {
             let seen = node.last_seen.as_deref().and_then(millis);
             let silent = seen.map_or(0, |s| now_ms - s);
-            if seen.is_some()
-                && silent > AGENT_LOST_ALERT_MS
-                && !node.agent_lost_alerted
-                && !node.hub_node_id.is_some_and(|id| hub_offline.contains(&id))
-            {
+            let host_down = node.hub_node_id.is_some_and(|id| hub_offline.contains(&id));
+            if host_down {
+                node.host_down_ms = Some(now_ms);
+            }
+            let quiet = seen.map_or(0, |s| now_ms - s.max(node.host_down_ms.unwrap_or(0)));
+            if seen.is_some() && quiet > AGENT_LOST_ALERT_MS && !node.agent_lost_alerted && !host_down {
                 node.agent_lost_alerted = true;
                 alerts.push(format!(
                     "\u{26A0}\u{FE0F} <b>sb-agent 失联</b>\n节点  {}\n最后上报  {}\n机器本身还在线，多半是 sb-agent 停了：systemctl status sb-agent",
