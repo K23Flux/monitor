@@ -437,11 +437,43 @@ fn singbox_stopping_and_agents_going_quiet_are_announced() {
     e.check_status(now + Duration::minutes(7), &none);
     assert_eq!(
         e.state.pending[before..].iter().filter(|p| p.text.contains("失联")).count(),
-        2,
-        "the other one, once its machine is back"
+        1,
+        "the other one gets the full grace again once its machine is back"
     );
-    e.report(&token, &report(&node, json!({})), now + Duration::minutes(8)).unwrap();
+    // Last seen down at the six-minute check, so five minutes from there.
+    e.check_status(now + Duration::minutes(11), &none);
+    assert_eq!(e.state.pending[before..].iter().filter(|p| p.text.contains("失联")).count(), 1);
+    e.check_status(now + Duration::minutes(11) + Duration::seconds(10), &none);
+    assert_eq!(
+        e.state.pending[before..].iter().filter(|p| p.text.contains("失联")).count(),
+        2,
+        "and is alerted after five more minutes of silence with its machine up"
+    );
+    e.report(&token, &report(&node, json!({})), now + Duration::minutes(12)).unwrap();
     assert!(e.state.pending.last().unwrap().text.contains("恢复上报"));
+}
+
+#[test]
+fn a_blip_of_the_hubs_own_network_is_not_an_sb_agent_lost() {
+    let (mut e, _, _) = registered("");
+    let none = std::collections::HashSet::new();
+    let now = t0();
+    let reg = e.register_linked(4, "linked", &json!({}), now);
+    let (node, token) =
+        (reg["node_id"].as_str().unwrap().to_owned(), reg["agent_token"].as_str().unwrap().to_owned());
+    e.report(&token, &report(&node, json!({})), now).unwrap();
+    // The hub loses its network: every agent drops, then they come back one by one.
+    let mut t = now;
+    while t < now + Duration::minutes(5) + Duration::seconds(30) {
+        t += Duration::seconds(10);
+        e.check_status(t, &std::collections::HashSet::from([4]));
+    }
+    // The machine's agent is back first; the sb-agent's next report is a little later.
+    e.check_status(t + Duration::seconds(10), &none);
+    e.check_status(t + Duration::seconds(60), &none);
+    assert!(!e.state.pending.iter().any(|p| p.text.contains("失联")), "{:?}", e.state.pending);
+    e.report(&token, &report(&node, json!({})), t + Duration::seconds(70)).unwrap();
+    assert!(!e.state.pending.iter().any(|p| p.text.contains("恢复上报")));
 }
 
 #[test]
