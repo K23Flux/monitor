@@ -31,7 +31,7 @@ import (
 )
 
 const (
-	version        = "0.6.0"
+	version        = "0.7.0"
 	configFile     = "/etc/sb-agent/config.json"
 	stateFile      = "/var/lib/sb-agent/state.json"
 	singBoxConfig  = "/etc/sing-box/config.json"
@@ -159,6 +159,46 @@ type Report struct {
 	// maxConnsPerReport; the rest are only counted in ConnsDropped.
 	Conns        []ConnLog `json:"conns,omitempty"`
 	ConnsDropped int       `json:"conns_dropped,omitempty"`
+	// Open lists the connections open right now on the inbounds the hub
+	// watches (it names them in watch_tags), from clash_api; TagBytes is each
+	// inbound's traffic counted since the agent started. Both feed the
+	// connection monitor's live view.
+	Open     []OpenConn `json:"open,omitempty"`
+	TagBytes []TagBytes `json:"tag_bytes,omitempty"`
+}
+
+// LiveReport is what the agent sends every second while the hub has a
+// watched user online on this machine (see liveLoop): only what clash_api
+// knows, no log scan and no nftables read.
+type LiveReport struct {
+	NodeID    string     `json:"node_id"`
+	Timestamp int64      `json:"timestamp"`
+	Live      []TagLive  `json:"live"`
+	Open      []OpenConn `json:"open"`
+	TagBytes  []TagBytes `json:"tag_bytes"`
+}
+
+type TagLive struct {
+	Tag  string `json:"tag"`
+	Live int    `json:"live"`
+}
+
+// OpenConn is one connection open right now: where to, since when (unix ms)
+// and the bytes it has carried so far.
+type OpenConn struct {
+	Tag   string `json:"tag"`
+	Dst   string `json:"dst"`
+	Net   string `json:"net,omitempty"`
+	Start int64  `json:"start"`
+	Up    uint64 `json:"up"`
+	Down  uint64 `json:"down"`
+}
+
+// TagBytes only grows while the agent runs; the hub takes differences.
+type TagBytes struct {
+	Tag  string `json:"tag"`
+	Up   uint64 `json:"up"`
+	Down uint64 `json:"down"`
 }
 
 // ConnLog is one connection sing-box routed: when, on which inbound, whose
@@ -189,6 +229,11 @@ type SingboxStatus struct {
 type apiResponse struct {
 	OK    bool   `json:"ok"`
 	Error string `json:"error"`
+	// WatchTags are the inbounds whose open connections the hub wants listed,
+	// Fast whether a watched user is online here, so the agent should send a
+	// live report every second. Hubs before 1.4.1-sb.6 send neither.
+	WatchTags []string `json:"watch_tags"`
+	Fast      bool     `json:"fast"`
 }
 
 var httpClient = &http.Client{
@@ -305,6 +350,7 @@ func runAgent() error {
 	}
 	lastSave := time.Time{}
 	log.Printf("已连接节点 %s，固定配置路径 %s", cfg.Name, cfg.ConfigPath)
+	go liveLoop(ctx, cfg)
 
 	for {
 		if err := collectAndReport(&cfg, &state); err != nil {
@@ -485,6 +531,10 @@ func collectAndReport(cfg *Config, state *AgentState) error {
 		UserTraffic: userTraffic,
 	}
 	report.Conns, report.ConnsDropped = tracker.connLogs(inbounds)
+	if clashUsage.ready() {
+		report.Open = clashUsage.openConns(liveMode.tags())
+		report.TagBytes = clashUsage.tagBytes()
+	}
 	var response apiResponse
 	if err := postJSON(cfg.Server+apiPrefix+"/agent/report", cfg.AgentToken, report, &response); err != nil {
 		return err
@@ -492,6 +542,7 @@ func collectAndReport(cfg *Config, state *AgentState) error {
 	if !response.OK {
 		return errors.New(response.Error)
 	}
+	liveMode.set(response.WatchTags, response.Fast)
 	tracker.commit()
 	clashUsage.commit()
 	if state.LastLogUnix == 0 || now.Unix()-state.LastLogUnix >= 30 {
@@ -1536,7 +1587,9 @@ type clashConn struct {
 	ID       string `json:"id"`
 	Upload   uint64 `json:"upload"`
 	Download uint64 `json:"download"`
+	Start    string `json:"start"`
 	Metadata struct {
+		Network    string `json:"network"`
 		Type       string `json:"type"`
 		SourceIP   string `json:"sourceIP"`
 		SourcePort string `json:"sourcePort"`
@@ -1625,14 +1678,19 @@ type clashWatch struct {
 	seeded  bool
 	err     error
 	pending map[string]*UserTraffic
+	// totals is each tag's upload / download since the agent started, bytes
+	// already carried by connections open at start excluded.
+	totals map[string]*[2]uint64
 }
 
 type watchedConn struct {
-	tag, peer, dest string
-	cur, done       [2]uint64 // done: already handed to a report
+	tag, peer, dest, net string
+	start                time.Time
+	cur, done            [2]uint64 // done: already handed to a report
+	counted              [2]uint64 // already added to totals
 }
 
-var clashUsage = &clashWatch{open: map[string]*watchedConn{}, pending: map[string]*UserTraffic{}}
+var clashUsage = &clashWatch{open: map[string]*watchedConn{}, pending: map[string]*UserTraffic{}, totals: map[string]*[2]uint64{}}
 
 var clashOnce sync.Once
 
@@ -1659,6 +1717,9 @@ func (w *clashWatch) update(conns []clashConn, err error) {
 	if err != nil {
 		return
 	}
+	if w.totals == nil {
+		w.totals = map[string]*[2]uint64{}
+	}
 	seen := make(map[string]bool, len(conns))
 	for _, c := range conns {
 		tag := c.tag()
@@ -1669,15 +1730,31 @@ func (w *clashWatch) update(conns []clashConn, err error) {
 		cur := [2]uint64{c.Upload, c.Download}
 		entry := w.open[c.ID]
 		if entry == nil {
-			entry = &watchedConn{tag: tag, peer: c.peer(), dest: c.destination()}
+			start, err := time.Parse(time.RFC3339Nano, c.Start)
+			if err != nil || start.After(time.Now()) {
+				start = time.Now()
+			}
+			entry = &watchedConn{tag: tag, peer: c.peer(), dest: c.destination(), net: strings.ToLower(c.Metadata.Network), start: start}
 			// Connections already open when the agent started carried their
 			// earlier bytes before monitoring (or in the previous run's reports).
 			if !w.seeded {
 				entry.done = cur
+				entry.counted = cur
 			}
 			w.open[c.ID] = entry
 		}
 		entry.cur = cur
+		total := w.totals[tag]
+		if total == nil {
+			total = &[2]uint64{}
+			w.totals[tag] = total
+		}
+		for i := range cur {
+			if cur[i] > entry.counted[i] {
+				total[i] += cur[i] - entry.counted[i]
+				entry.counted[i] = cur[i]
+			}
+		}
 	}
 	for id, entry := range w.open {
 		if !seen[id] {
@@ -1747,6 +1824,156 @@ func (w *clashWatch) usage(t *connTracker) []UserTraffic {
 		return result[i].Tag+"|"+result[i].User < result[j].Tag+"|"+result[j].User
 	})
 	return result
+}
+
+// ready reports whether clash_api answered at the last poll.
+func (w *clashWatch) ready() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.seeded && w.err == nil
+}
+
+// maxOpenConns caps the open connections listed per report.
+const maxOpenConns = 200
+
+// openConns lists the open connections on the given tags, oldest first,
+// health checks left out.
+func (w *clashWatch) openConns(tags map[string]bool) []OpenConn {
+	if len(tags) == 0 {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	result := []OpenConn{}
+	for _, c := range w.open {
+		if !tags[c.tag] || isHealthCheck(hostOnly(c.dest)) {
+			continue
+		}
+		result = append(result, OpenConn{Tag: c.tag, Dst: c.dest, Net: c.net, Start: c.start.UnixMilli(), Up: c.cur[0], Down: c.cur[1]})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Start != result[j].Start {
+			return result[i].Start < result[j].Start
+		}
+		return result[i].Dst < result[j].Dst
+	})
+	if len(result) > maxOpenConns {
+		result = result[len(result)-maxOpenConns:]
+	}
+	return result
+}
+
+func (w *clashWatch) tagBytes() []TagBytes {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	result := make([]TagBytes, 0, len(w.totals))
+	for tag, total := range w.totals {
+		result = append(result, TagBytes{Tag: tag, Up: total[0], Down: total[1]})
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Tag < result[j].Tag })
+	return result
+}
+
+// liveCounts is snapshot's per-tag count as a list for the live report.
+func (w *clashWatch) liveCounts(tags map[string]bool) []TagLive {
+	live, ok := w.snapshot()
+	if !ok {
+		return nil
+	}
+	result := []TagLive{}
+	for tag := range tags {
+		result = append(result, TagLive{Tag: tag, Live: live[tag]})
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Tag < result[j].Tag })
+	return result
+}
+
+// ---- live reports ------------------------------------------------------------
+
+// liveState is what the hub's last answer asked for: which tags it watches
+// and whether one of them has a user online here. Fast lapses on its own if
+// no answer renews it, so a hub that went away is not called every second.
+type liveState struct {
+	mu        sync.Mutex
+	watchTags map[string]bool
+	fastUntil time.Time
+}
+
+var liveMode = &liveState{}
+
+// liveLapse is how long one "fast" answer keeps the live reports going.
+const liveLapse = 15 * time.Second
+
+func (l *liveState) set(tags []string, fast bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.watchTags = map[string]bool{}
+	for _, tag := range tags {
+		if tag = strings.TrimSpace(tag); tag != "" {
+			l.watchTags[tag] = true
+		}
+	}
+	if fast {
+		l.fastUntil = time.Now().Add(liveLapse)
+	} else {
+		l.fastUntil = time.Time{}
+	}
+}
+
+func (l *liveState) tags() map[string]bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	result := make(map[string]bool, len(l.watchTags))
+	for tag := range l.watchTags {
+		result[tag] = true
+	}
+	return result
+}
+
+func (l *liveState) fast() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return time.Now().Before(l.fastUntil)
+}
+
+// liveLoop sends a live report every second while the hub says a watched user
+// is online on this machine, so the panel follows her connections and speed
+// in real time. It only reads what the clash_api poller already holds.
+func liveLoop(ctx context.Context, cfg Config) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	failures := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if !liveMode.fast() || !clashUsage.ready() {
+			continue
+		}
+		tags := liveMode.tags()
+		report := LiveReport{
+			NodeID:    cfg.NodeID,
+			Timestamp: time.Now().UnixMilli(),
+			Live:      clashUsage.liveCounts(tags),
+			Open:      clashUsage.openConns(tags),
+			TagBytes:  clashUsage.tagBytes(),
+		}
+		var response apiResponse
+		if err := postJSON(cfg.Server+apiPrefix+"/agent/live", cfg.AgentToken, report, &response); err != nil || !response.OK {
+			failures++
+			if failures == 3 {
+				log.Printf("实时上报失败，等下一次常规上报后再试: %v", err)
+			}
+			if failures >= 3 {
+				liveMode.set(nil, false)
+			}
+			continue
+		}
+		failures = 0
+		liveMode.set(response.WatchTags, response.Fast)
+	}
 }
 
 func (w *clashWatch) lastError() error {

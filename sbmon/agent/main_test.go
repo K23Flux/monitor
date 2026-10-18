@@ -490,3 +490,57 @@ func TestConnLogs(t *testing.T) {
 		t.Fatalf("cap: %d %d", len(logs), dropped)
 	}
 }
+
+func TestClashTotalsAndOpenConnections(t *testing.T) {
+	conn := func(id, tag, host, start string, up, down uint64) clashConn {
+		var c clashConn
+		c.ID, c.Upload, c.Download, c.Start = id, up, down, start
+		c.Metadata.Type, c.Metadata.SourceIP, c.Metadata.SourcePort, c.Metadata.Host = "hysteria2/"+tag, "203.0.113.9", id, host
+		c.Metadata.Network = "UDP"
+		return c
+	}
+	w := &clashWatch{open: map[string]*watchedConn{}, pending: map[string]*UserTraffic{}}
+	// Open before the agent started: earlier bytes stay out of the totals.
+	w.update([]clashConn{conn("1", "hy2_wty", "a.example", "2026-10-18T11:00:00Z", 100, 1000)}, nil)
+	w.update([]clashConn{
+		conn("1", "hy2_wty", "a.example", "2026-10-18T11:00:00Z", 150, 1600),
+		conn("2", "hy2_wty", "www.apple.com", "2026-10-18T11:00:05Z", 5, 5),
+		conn("3", "hy2-in", "b.example", "2026-10-18T11:00:02Z", 40, 50),
+	}, nil)
+	// "3" closes: what it carried stays counted.
+	w.update([]clashConn{conn("1", "hy2_wty", "a.example", "2026-10-18T11:00:00Z", 160, 1700)}, nil)
+	got := fmt.Sprint(w.tagBytes())
+	if want := fmt.Sprint([]TagBytes{{"hy2-in", 40, 50}, {"hy2_wty", 65, 705}}); got != want {
+		t.Fatalf("totals %s, want %s", got, want)
+	}
+	open := w.openConns(map[string]bool{"hy2_wty": true})
+	if len(open) != 1 || open[0].Dst != "a.example" || open[0].Net != "udp" || open[0].Up != 160 || open[0].Down != 1700 ||
+		open[0].Start != time.Date(2026, 10, 18, 11, 0, 0, 0, time.UTC).UnixMilli() {
+		t.Fatalf("open %+v", open)
+	}
+	if w.openConns(nil) != nil {
+		t.Fatal("no watched tags, no list")
+	}
+	if live := w.liveCounts(map[string]bool{"hy2_wty": true, "gone": true}); fmt.Sprint(live) != fmt.Sprint([]TagLive{{"gone", 0}, {"hy2_wty", 1}}) {
+		t.Fatalf("live %v", live)
+	}
+}
+
+func TestLiveModeLapses(t *testing.T) {
+	l := &liveState{}
+	if l.fast() || len(l.tags()) != 0 {
+		t.Fatal("starts idle")
+	}
+	l.set([]string{"hy2_wty", " ", "ss2022_wty"}, true)
+	if !l.fast() || len(l.tags()) != 2 {
+		t.Fatalf("fast with tags: %v", l.tags())
+	}
+	l.fastUntil = time.Now().Add(-time.Second)
+	if l.fast() {
+		t.Fatal("lapses without a renewing answer")
+	}
+	l.set([]string{"hy2_wty"}, false)
+	if l.fast() || !l.tags()["hy2_wty"] {
+		t.Fatal("slow keeps the tags")
+	}
+}

@@ -7,14 +7,14 @@
 //! copying that file and the `history/` directory beside it, and the sb-agents
 //! on the landing nodes keep their node ids and tokens.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-pub const VERSION: &str = "0.4.0";
+pub const VERSION: &str = "0.7.0";
 
 const MAX_EVENTS: usize = 500;
 const MAX_USER_EVENTS: usize = 300;
@@ -35,6 +35,12 @@ const AGENT_LOST_ALERT_MS: i64 = 300_000;
 /// Daily traffic buckets older than this are dropped. The plugin kept them
 /// forever; the panel only ever reads today and this month.
 const DAILY_KEEP_DAYS: i64 = 400;
+/// Open connections kept per watched inbound for the live view.
+const MAX_OPEN: usize = 100;
+/// Speed is the traffic over about this long, from the latest readings.
+const RATE_WINDOW_MS: i64 = 4_000;
+/// A speed reading older than this shows as zero: the agent went quiet.
+const RATE_STALE_MS: i64 = 12_000;
 
 // ---- time and text helpers -------------------------------------------------
 
@@ -345,6 +351,10 @@ pub struct Node {
     /// Not persisted: after a restart every agent starts disconnected anyway.
     #[serde(skip)]
     pub host_down_ms: Option<i64>,
+    /// Each inbound's byte totals (upload, download) as the agent last counted
+    /// them (sb-agent 0.7.0 `tag_bytes`), to take differences against.
+    #[serde(skip)]
+    pub tag_bytes: BTreeMap<String, (f64, f64)>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -396,6 +406,27 @@ pub struct Watch {
     pub live: i64,
     pub visits: Vec<Visit>,
     pub visits_dropped: i64,
+    /// Traffic of the current session (sb-agent 0.7.0 with clash_api).
+    pub session_up: f64,
+    pub session_down: f64,
+    /// Connections open right now, as the agent last listed them.
+    #[serde(skip)]
+    pub open: Vec<OpenConn>,
+    /// (ms, session upload, session download) readings for the speed.
+    #[serde(skip)]
+    pub samples: VecDeque<(i64, f64, f64)>,
+}
+
+/// One connection open on a watched inbound.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct OpenConn {
+    pub dst: String,
+    pub net: String,
+    /// Unix ms.
+    pub start: i64,
+    pub up: f64,
+    pub down: f64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -418,6 +449,10 @@ pub struct UserEvent {
     pub visits: Option<Vec<Visit>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_up: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_down: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -553,6 +588,49 @@ fn human_duration(from: &str, to: &str) -> String {
     } else {
         format!("{seconds}s")
     }
+}
+
+/// Bytes as the panel shows them: 1024-based, three significant figures.
+pub fn human_bytes(value: f64) -> String {
+    let units = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = value.max(0.0);
+    let mut unit = 0;
+    while v >= 1024.0 && unit < units.len() - 1 {
+        v /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{v:.0} B")
+    } else if v >= 100.0 {
+        format!("{v:.0} {}", units[unit])
+    } else if v >= 10.0 {
+        format!("{v:.1} {}", units[unit])
+    } else {
+        format!("{v:.2} {}", units[unit])
+    }
+}
+
+/// Upload and download per second over the latest readings: from the newest
+/// back to the oldest one within `RATE_WINDOW_MS`, or the one before the newest
+/// when that is all there is (agents reporting every five seconds).
+fn speed(samples: &VecDeque<(i64, f64, f64)>, now_ms: i64) -> (f64, f64) {
+    let Some(&(last_ms, up, down)) = samples.back() else { return (0.0, 0.0) };
+    if now_ms - last_ms > RATE_STALE_MS || samples.len() < 2 {
+        return (0.0, 0.0);
+    }
+    let previous = samples.iter().rev().skip(1);
+    let mut base = samples[samples.len() - 2];
+    for &sample in previous {
+        if last_ms - sample.0 > RATE_WINDOW_MS {
+            break;
+        }
+        base = sample;
+    }
+    let seconds = (last_ms - base.0) as f64 / 1000.0;
+    if seconds <= 0.0 {
+        return (0.0, 0.0);
+    }
+    (((up - base.1) / seconds).max(0.0), ((down - base.2) / seconds).max(0.0))
 }
 
 fn sorted_visits(watch: &Watch) -> Vec<Visit> {
@@ -905,7 +983,154 @@ impl Engine {
                 watch.live = 0;
             }
         }
-        Ok(json!({"ok": true, "server_time": now_iso}))
+        self.apply_live(&node_id, body, now);
+        Ok(self.agent_answer(&node_id, &now_iso))
+    }
+
+    /// What the agent is told after a report: which inbounds to list open
+    /// connections for, and whether to send a live report every second (a
+    /// watched user is online, or about to be, on this machine).
+    fn agent_answer(&self, node_id: &str, now_iso: &str) -> Value {
+        let node = self.state.nodes.get(node_id);
+        let watching = node.is_some_and(|n| !n.watch_off);
+        let tags: Vec<&String> = if watching {
+            node.map(|n| {
+                n.inbounds.iter().map(|i| &i.tag).filter(|t| self.config.rule_for(t).is_some()).collect()
+            })
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let fast =
+            watching && self.state.watch.values().any(|w| w.node_id == node_id && (w.online || w.pending));
+        json!({"ok": true, "server_time": now_iso, "watch_tags": tags, "fast": fast})
+    }
+
+    /// A live report (sb-agent 0.7.0 `agent/live`, every second while a watched
+    /// user is online there): open connections per inbound, each inbound's byte
+    /// totals, and the live count, which keeps the session going and may
+    /// confirm a tentative one.
+    pub fn live(&mut self, bearer: &str, body: &Value, now: DateTime<Utc>) -> Result<Value, Refusal> {
+        let node_id = clean_text(&text(body.get("node_id").unwrap_or(&Value::Null)), 100);
+        let authed = self.state.nodes.get(&node_id).is_some_and(|n| sha256_hex(bearer) == n.agent_token_hash);
+        if !authed {
+            return Err(Refusal(401, "Agent 身份验证失败"));
+        }
+        let now_iso = iso(now);
+        if let Some(node) = self.state.nodes.get_mut(&node_id) {
+            node.last_seen = Some(now_iso.clone());
+        }
+        let watch_off = self.state.nodes.get(&node_id).is_some_and(|n| n.watch_off);
+        for item in body.get("live").and_then(Value::as_array).map(|v| &v[..v.len().min(50)]).unwrap_or(&[]) {
+            let tag = clean_text(&text(item.get("tag").unwrap_or(&Value::Null)), 100);
+            let live =
+                item.get("live").and_then(number).filter(|n| n.is_finite()).unwrap_or(0.0).max(0.0) as i64;
+            let key = watch_key(&node_id, &tag);
+            if watch_off {
+                continue;
+            }
+            let Some(mut watch) = self.state.watch.remove(&key) else { continue };
+            if watch.online || watch.pending {
+                watch.live = live;
+                watch.live_tracked = true;
+                if live > 0 {
+                    watch.last_active = Some(now_iso.clone());
+                }
+                self.confirm(&mut watch, live, now);
+            }
+            self.state.watch.insert(key, watch);
+        }
+        self.apply_live(&node_id, body, now);
+        Ok(self.agent_answer(&node_id, &now_iso))
+    }
+
+    /// Books `tag_bytes` and `open` from a report or a live report onto the
+    /// sessions in progress on that node.
+    fn apply_live(&mut self, node_id: &str, body: &Value, now: DateTime<Utc>) {
+        let now_ms = now.timestamp_millis();
+        if let Some(items) = body.get("tag_bytes").and_then(Value::as_array) {
+            for item in items.iter().take(200) {
+                let tag = clean_text(&text(item.get("tag").unwrap_or(&Value::Null)), 100);
+                if tag.is_empty() {
+                    continue;
+                }
+                let (up, down) = (
+                    safe_count(item.get("up").unwrap_or(&Value::Null)),
+                    safe_count(item.get("down").unwrap_or(&Value::Null)),
+                );
+                let Some(node) = self.state.nodes.get_mut(node_id) else { return };
+                // The first reading after a hub restart only sets the base;
+                // totals that went down mean the agent restarted from zero.
+                let delta = match node.tag_bytes.insert(tag.clone(), (up, down)) {
+                    Some((pu, pd)) if up >= pu && down >= pd => (up - pu, down - pd),
+                    Some(_) => (up, down),
+                    None => (0.0, 0.0),
+                };
+                if let Some(watch) = self.state.watch.get_mut(&watch_key(node_id, &tag)) {
+                    if watch.online || watch.pending {
+                        watch.session_up += delta.0;
+                        watch.session_down += delta.1;
+                        watch.samples.push_back((now_ms, watch.session_up, watch.session_down));
+                        while watch.samples.len() > 12 {
+                            watch.samples.pop_front();
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(items) = body.get("open").and_then(Value::as_array) {
+            let mut by_tag: BTreeMap<String, Vec<OpenConn>> = BTreeMap::new();
+            for item in items.iter().take(1000) {
+                let get = |k: &str| item.get(k).unwrap_or(&Value::Null);
+                let tag = clean_text(&text(get("tag")), 100);
+                let dst = clean_text(&text(get("dst")), 253).trim().to_lowercase();
+                if tag.is_empty() || dst.is_empty() {
+                    continue;
+                }
+                let start = number(get("start"))
+                    .filter(|t| {
+                        t.is_finite()
+                            && *t <= (now_ms + 60_000) as f64
+                            && *t >= (now_ms - 30 * 86_400_000) as f64
+                    })
+                    .map_or(now_ms, |t| (t as i64).min(now_ms));
+                let list = by_tag.entry(tag).or_default();
+                if list.len() < MAX_OPEN {
+                    list.push(OpenConn {
+                        dst,
+                        net: clean_text(&text(get("net")), 8).to_lowercase(),
+                        start,
+                        up: safe_count(get("up")),
+                        down: safe_count(get("down")),
+                    });
+                }
+            }
+            for watch in self.state.watch.values_mut().filter(|w| w.node_id == node_id) {
+                watch.open = if watch.online || watch.pending {
+                    by_tag.remove(&watch.tag).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+            }
+        }
+    }
+
+    /// Announces a tentative session once `session_confirmed` holds.
+    fn confirm(&mut self, watch: &mut Watch, live: i64, now: DateTime<Utc>) {
+        if !(watch.pending && self.session_confirmed(watch, live, now)) {
+            return;
+        }
+        let now_iso = iso(now);
+        watch.pending = false;
+        watch.online = true;
+        let hosts: Vec<String> = watch.visits.iter().map(|v| v.host.clone()).collect();
+        let node_name = self.state.nodes.get(&watch.node_id).map(|n| n.name.clone()).unwrap_or_default();
+        let start = watch.session_start.clone().unwrap_or_else(|| now_iso.clone());
+        self.push_user_event("online", watch, &node_name, &start, hosts.clone());
+        if self.config.notify_online {
+            let text = self.format_online(watch, &node_name, &hosts);
+            self.enqueue_telegram(text, now);
+        }
     }
 
     /// Whether a tentative session is announced as online. A lone short request
@@ -988,24 +1213,16 @@ impl Engine {
             watch.session_conn = 0;
             watch.visits = Vec::new();
             watch.visits_dropped = 0;
+            watch.session_up = 0.0;
+            watch.session_down = 0.0;
+            watch.samples.clear();
+            watch.open.clear();
         }
         for (host, time) in &cleaned {
             add_visit(&mut watch, host, time);
         }
         watch.session_conn += info.conn;
-
-        if watch.pending && self.session_confirmed(&watch, info.live, now) {
-            watch.pending = false;
-            watch.online = true;
-            let hosts: Vec<String> = watch.visits.iter().map(|v| v.host.clone()).collect();
-            let node_name = self.state.nodes.get(node_id).map(|n| n.name.clone()).unwrap_or_default();
-            let start = watch.session_start.clone().unwrap_or_else(|| now_iso.clone());
-            self.push_user_event("online", &watch, &node_name, &start, hosts.clone());
-            if self.config.notify_online {
-                let text = self.format_online(&watch, &node_name, &hosts);
-                self.enqueue_telegram(text, now);
-            }
-        }
+        self.confirm(&mut watch, info.live, now);
         self.state.watch.insert(key, watch);
     }
 
@@ -1049,6 +1266,8 @@ impl Engine {
             changed = true;
             let mut watch = self.state.watch.remove(&key).expect("present");
             watch.live = 0;
+            watch.open.clear();
+            watch.samples.clear();
             if watch.pending {
                 // Never confirmed (a lone short request): drop it without any alert.
                 watch.pending = false;
@@ -1065,6 +1284,10 @@ impl Engine {
             event.session_conn = Some(watch.session_conn);
             event.visits = Some(visits.into_iter().take(60).collect());
             event.note = Some(note.clone());
+            if watch.session_up + watch.session_down > 0.0 {
+                event.session_up = Some(watch.session_up);
+                event.session_down = Some(watch.session_down);
+            }
             if self.config.notify_offline {
                 for text in self.format_offline(&watch, &node_name, &end, &note) {
                     self.enqueue_telegram(text, now);
@@ -1103,6 +1326,13 @@ impl Engine {
             format!("时长  {}", human_duration(start, end)),
             format!("连接  {} 次", watch.session_conn),
         ];
+        if watch.session_up + watch.session_down > 0.0 {
+            head.push(format!(
+                "流量  ↓ {}  ↑ {}",
+                human_bytes(watch.session_down),
+                human_bytes(watch.session_up)
+            ));
+        }
         if !note.is_empty() {
             head.push(format!("备注  {}", escape_html(note)));
         }
@@ -1282,6 +1512,36 @@ impl Engine {
     /// from reported inbounds so a watched user shows as offline even before
     /// their first connection.
     pub fn admin_watch(&self, now: DateTime<Utc>) -> Value {
+        let events: Vec<&UserEvent> = self.state.user_events.iter().rev().take(120).collect();
+        json!({
+            "ok": true,
+            "version": VERSION,
+            "server_time": iso(now),
+            "timezone_offset": self.config.timezone_offset,
+            "session_idle_seconds": self.config.session_idle_seconds,
+            "offline_grace_seconds": self.config.offline_grace_seconds,
+            "online_confirm_seconds": self.config.online_confirm_seconds,
+            "telegram_configured": self.config.telegram_configured(),
+            "rules": self.config.watch_rules,
+            "watched": self.watch_rows(now),
+            "events_rev": self.events_rev(),
+            "events": events,
+        })
+    }
+
+    /// The live frame the panel's stream carries: the watched rows only. The
+    /// page fetches the events again when `events_rev` moves.
+    pub fn admin_watch_live(&self, now: DateTime<Utc>) -> Value {
+        json!({"server_time": iso(now), "events_rev": self.events_rev(), "watched": self.watch_rows(now)})
+    }
+
+    fn events_rev(&self) -> String {
+        let last = self.state.user_events.last().map(|e| e.id.as_str()).unwrap_or_default();
+        format!("{}:{last}", self.state.user_events.len())
+    }
+
+    fn watch_rows(&self, now: DateTime<Utc>) -> Vec<Value> {
+        let now_ms = now.timestamp_millis();
         let mut rows: BTreeMap<String, serde_json::Map<String, Value>> = BTreeMap::new();
         for node in self.state.nodes.values().filter(|n| !n.watch_off) {
             let node_online = self.node_online(node, now);
@@ -1321,25 +1581,29 @@ impl Engine {
             base.insert("lastSource".into(), json!(watch.last_source));
             base.insert("connTotal".into(), json!(watch.conn_count));
             base.insert("domains".into(), json!(domains));
+            let active = watch.online || watch.pending;
+            let (rate_up, rate_down) = if active { speed(&watch.samples, now_ms) } else { (0.0, 0.0) };
+            let mut visits = if active { watch.visits.clone() } else { Vec::new() };
+            visits.sort_by(|a, b| b.count.cmp(&a.count).then(b.last.cmp(&a.last)));
+            visits.truncate(100);
+            base.insert("pending".into(), json!(watch.pending));
+            base.insert(
+                "pendingStart".into(),
+                if watch.pending { json!(watch.session_start) } else { Value::Null },
+            );
+            base.insert("rateUp".into(), json!(rate_up));
+            base.insert("rateDown".into(), json!(rate_down));
+            base.insert("sessionUp".into(), json!(if active { watch.session_up } else { 0.0 }));
+            base.insert("sessionDown".into(), json!(if active { watch.session_down } else { 0.0 }));
+            base.insert("open".into(), json!(if active { &watch.open[..] } else { &[] }));
+            base.insert("sessionVisits".into(), json!(visits));
+            base.insert("visitsDropped".into(), json!(if active { watch.visits_dropped } else { 0 }));
         }
         let mut watched: Vec<Value> = rows.into_values().map(Value::Object).collect();
         let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
         watched
             .sort_by(|a, b| s(a, "label").cmp(&s(b, "label")).then(s(a, "nodeName").cmp(&s(b, "nodeName"))));
-        let events: Vec<&UserEvent> = self.state.user_events.iter().rev().take(120).collect();
-        json!({
-            "ok": true,
-            "version": VERSION,
-            "server_time": iso(now),
-            "timezone_offset": self.config.timezone_offset,
-            "session_idle_seconds": self.config.session_idle_seconds,
-            "offline_grace_seconds": self.config.offline_grace_seconds,
-            "online_confirm_seconds": self.config.online_confirm_seconds,
-            "telegram_configured": self.config.telegram_configured(),
-            "rules": self.config.watch_rules,
-            "watched": watched,
-            "events": events,
-        })
+        watched
     }
 
     pub fn create_registration(&mut self, name: &str, now: DateTime<Utc>) -> Result<Value, &'static str> {

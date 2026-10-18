@@ -3,7 +3,7 @@
 // sbmon module under /api/sbmonitor/v1 (src/sbmon).
 
 import { useCallback, useEffect, useMemo, useState } from "react"
-import { ChevronDown, ChevronRight, Copy, LineChart, ListTree, Pencil, RefreshCw, Send, Trash2 } from "lucide-react"
+import { Copy, LineChart, Pencil, RefreshCw, Send, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -57,46 +57,6 @@ type SbState = {
   pending: number
 }
 
-type Visit = { host: string; first: string; last: string; count: number }
-type WatchRow = {
-  label: string
-  tag: string
-  port: number | null
-  nodeId: string
-  nodeName: string
-  nodeOnline: boolean
-  online: boolean
-  live: number
-  liveTracked: boolean
-  sessionStart: string | null
-  sessionConn: number
-  lastActive: string | null
-  lastSource: string
-  connTotal: number
-  domains: string[]
-}
-type UserEvent = {
-  id: string
-  kind: "online" | "offline"
-  label: string
-  tag: string
-  nodeName: string
-  source: string
-  domains: string[]
-  time: string
-  sessionStart?: string
-  sessionConn?: number
-  visits?: Visit[]
-  note?: string
-}
-type WatchState = {
-  server_time: string
-  telegram_configured: boolean
-  rules: { tag: string; label: string }[]
-  watched: WatchRow[]
-  events: UserEvent[]
-}
-
 /** Polls `path` every `ms` while the page is open. */
 function usePoll<T>(path: string, ms = 5000) {
   const [data, setData] = useState<T | null>(null)
@@ -128,23 +88,6 @@ function speed(bytesPerSecond: number) {
 
 const when = (iso: string | null) => (iso ? new Date(iso).toLocaleString("zh-CN", { hour12: false }) : "从未")
 const clock = (iso: string) => new Date(iso).toLocaleTimeString("zh-CN", { hour12: false })
-
-function ago(iso: string | null, now: number) {
-  if (!iso) return "从未"
-  const s = Math.max(0, Math.round((now - new Date(iso).getTime()) / 1000))
-  if (s < 60) return `${s} 秒前`
-  if (s < 3600) return `${Math.floor(s / 60)} 分钟前`
-  if (s < 86400) return `${Math.floor(s / 3600)} 小时前`
-  return `${Math.floor(s / 86400)} 天前`
-}
-
-function span(from: string | null, to: number) {
-  if (!from) return "—"
-  const s = Math.max(0, Math.round((to - new Date(from).getTime()) / 1000))
-  const h = Math.floor(s / 3600)
-  const m = Math.floor((s % 3600) / 60)
-  return h > 0 ? `${h}h${m}m` : m > 0 ? `${m}m` : `${s}s`
-}
 
 async function copy(text: string) {
   try {
@@ -837,39 +780,6 @@ export function SingBox({ hubNodes }: { hubNodes: HubNode[] }) {
 
 // ---- 连接监控: watched users -------------------------------------------------
 
-function EventRow({ event }: { event: UserEvent }) {
-  const [open, setOpen] = useState(false)
-  const online = event.kind === "online"
-  const visits = event.visits ?? []
-  return (
-    <div className="py-2.5">
-      <button className="flex w-full items-start gap-2 text-left text-sm" onClick={() => setOpen(!open)} disabled={online || !visits.length}>
-        {!online && visits.length ? (open ? <ChevronDown className="mt-0.5 size-4 shrink-0" /> : <ChevronRight className="mt-0.5 size-4 shrink-0" />) : <span className="size-4 shrink-0" />}
-        <span className="tnum w-36 shrink-0 text-xs text-muted-foreground">{when(event.time)}</span>
-        <Badge variant={online ? "default" : "secondary"}>{online ? "上线" : "下线"}</Badge>
-        <span className="min-w-0 flex-1">
-          <span className="font-medium">{event.label}</span>
-          <span className="text-muted-foreground"> · {event.nodeName}</span>
-          {!online && event.sessionStart && (
-            <span className="text-muted-foreground"> · 时长 {span(event.sessionStart, new Date(event.time).getTime())} · {event.sessionConn ?? 0} 次连接 · {visits.length} 个域名</span>
-          )}
-          {online && event.domains.length > 0 && <span className="text-muted-foreground"> · {event.domains.slice(0, 3).join(", ")}</span>}
-          {event.note && <span className="text-amber-600"> · {event.note}</span>}
-        </span>
-      </button>
-      {open && (
-        <div className="mt-2 ml-6 max-h-72 overflow-auto rounded-md bg-muted/40 p-3 font-mono text-xs">
-          {visits.map((v) => (
-            <div key={v.host}>
-              {clock(v.first)}  {v.host}{v.count > 1 && ` ×${v.count}（至 ${clock(v.last)}）`}
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
-
 type Detected = { tag: string; users: string[]; type: string; nodes: string[] }
 
 /** Watch rules as `tag → label`, in the order written. */
@@ -937,7 +847,7 @@ function DetectedInbounds({ rules, onChange }: { rules: string; onChange: (v: st
   )
 }
 
-function WatchSettings({ onSaved }: { onSaved: () => void }) {
+export function WatchSettings({ onSaved, embedded = false }: { onSaved: () => void; embedded?: boolean }) {
   const [form, setForm] = useState<Record<string, string> | null>(null)
   const [tokenSet, setTokenSet] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -987,13 +897,15 @@ function WatchSettings({ onSaved }: { onSaved: () => void }) {
   }
 
   return (
-    <Card className="gap-5 p-5">
-      <div>
-        <h3 className="text-sm font-medium">监控设置</h3>
-        <p className="mt-1 text-xs text-muted-foreground">
-          {"这里的 Telegram 机器人发连接监控的上线、下线通知，以及 sing-box 停止、sb-agent 失联的提醒；和「通知」页的整机告警分开。"}
-        </p>
-      </div>
+    <Card className={embedded ? "gap-5 border-0 p-0 shadow-none" : "gap-5 p-5"}>
+      {!embedded && (
+        <div>
+          <h3 className="text-sm font-medium">监控设置</h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {"这里的 Telegram 机器人发连接监控的上线、下线通知，以及 sing-box 停止、sb-agent 失联的提醒；和「通知」页的整机告警分开。"}
+          </p>
+        </div>
+      )}
       <div className="space-y-1.5">
         <Label htmlFor="sb-watch_rules">监控用户</Label>
         <textarea
@@ -1061,103 +973,5 @@ function WatchSettings({ onSaved }: { onSaved: () => void }) {
         <Button variant="outline" onClick={test}><Send className="size-4" /> 发测试消息</Button>
       </div>
     </Card>
-  )
-}
-
-export function ConnWatch() {
-  const { data, error, reload } = usePoll<WatchState>(`${SB}/watch`)
-  const [logOf, setLogOf] = useState<string | null>(null)
-  if (!data) return error ? <p className="text-sm text-destructive">{error}</p> : <p className="text-sm text-muted-foreground">加载中…</p>
-  const now = new Date(data.server_time).getTime()
-  const groups = new Map<string, WatchRow[]>()
-  for (const row of data.watched) groups.set(row.label, [...(groups.get(row.label) ?? []), row])
-
-  return (
-    <div className="space-y-5">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h2 className="text-lg font-semibold">连接监控</h2>
-          <p className="text-sm text-muted-foreground">按入站监控指定用户的上线、下线和访问的域名</p>
-        </div>
-        <div className="flex items-center gap-2">
-          <Badge variant={data.telegram_configured ? "secondary" : "outline"}>
-            Telegram {data.telegram_configured ? "已配置" : "未配置"}
-          </Badge>
-          <Button variant="outline" size="sm" onClick={reload}><RefreshCw className="size-4" /> 刷新</Button>
-        </div>
-      </div>
-      {error && <p className="text-sm text-destructive">{error}</p>}
-
-      {!data.rules.length ? (
-        <Card className="p-6 text-sm text-muted-foreground">还没有配置监控用户，在下面的设置里填写。</Card>
-      ) : !data.watched.length ? (
-        <Card className="p-6 text-sm text-muted-foreground">已配置监控用户，但还没有节点上报对应的入站。确认落地机装了 sb-agent，且 sing-box 配置里有该 tag。</Card>
-      ) : (
-        [...groups.entries()].map(([label, rows]) => (
-          <Card key={label} className="gap-0 overflow-hidden p-0">
-            <div className="flex items-center gap-2 border-b bg-muted/40 px-4 py-3">
-              <span className={`size-2 rounded-full ${rows.some((r) => r.online) ? "bg-emerald-500" : "bg-muted-foreground/40"}`} />
-              <span className="font-medium">{label}</span>
-              <span className="text-xs text-muted-foreground">{rows.some((r) => r.online) ? "在线" : "离线"}</span>
-              <Button variant="ghost" size="sm" className="ml-auto" onClick={() => setLogOf(label)}>
-                <ListTree className="size-4" /> 连接日志
-              </Button>
-            </div>
-            <div className="divide-y">
-              {rows.map((r) => (
-                <div key={`${r.nodeId}:${r.tag}`} className="space-y-2 px-4 py-3">
-                  <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
-                    {r.online ? (
-                      <Badge>在线</Badge>
-                    ) : r.nodeOnline ? (
-                      <Badge variant="secondary">离线</Badge>
-                    ) : (
-                      <Badge variant="destructive">节点掉线</Badge>
-                    )}
-                    <span className="font-medium">{r.nodeName}</span>
-                    <span className="font-mono text-xs text-muted-foreground">{r.tag}{r.port ? ` :${r.port}` : ""}</span>
-                    <span className="text-xs text-muted-foreground">
-                      {r.online ? `本次会话 ${span(r.sessionStart, now)}` : `上次活跃 ${ago(r.lastActive, now)}`}
-                    </span>
-                    <span className="text-xs text-muted-foreground">
-                      {r.online
-                        ? r.liveTracked ? `在连 ${r.live} / 本次 ${r.sessionConn} 次` : `本次 ${r.sessionConn} 次连接`
-                        : `累计 ${r.connTotal} 次连接`}
-                    </span>
-                    {r.lastSource && <span className="font-mono text-xs text-muted-foreground">来自 {r.lastSource}</span>}
-                  </div>
-                  {r.domains.length > 0 ? (
-                    <div className="flex flex-wrap gap-1">
-                      {r.domains.slice(0, 12).map((d) => (
-                        <span key={d} className="rounded bg-muted px-1.5 py-0.5 font-mono text-[11px]">{d}</span>
-                      ))}
-                    </div>
-                  ) : (
-                    <p className="text-xs text-muted-foreground">暂无真实访问（测速探测已过滤）</p>
-                  )}
-                </div>
-              ))}
-            </div>
-          </Card>
-        ))
-      )}
-
-      <Card className="gap-1 p-5">
-        <div className="flex items-baseline justify-between">
-          <h3 className="text-sm font-medium">上线 / 下线记录</h3>
-          <span className="text-xs text-muted-foreground">最近 120 条，点下线记录展开访问的域名</span>
-        </div>
-        {data.events.length === 0 ? (
-          <p className="text-sm text-muted-foreground">暂无</p>
-        ) : (
-          <div className="max-h-[32rem] divide-y overflow-auto">
-            {data.events.map((e) => <EventRow key={e.id} event={e} />)}
-          </div>
-        )}
-      </Card>
-
-      <WatchSettings onSaved={reload} />
-      {logOf && <UserLogDialog user={logOf} onClose={() => setLogOf(null)} />}
-    </div>
   )
 }
