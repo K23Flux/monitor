@@ -21,6 +21,7 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use axum::body::Bytes;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, Path as UrlPath, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -32,7 +33,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
-use crate::api::{answer, Admin};
+use crate::api::{answer, socket_session, Admin};
 use crate::{App, Shared};
 use engine::{Config, Engine, State as SbState};
 
@@ -63,6 +64,9 @@ pub struct Sbmon {
     dir: PathBuf,
     flushing: AtomicBool,
     wake: tokio::sync::Notify,
+    /// Moves whenever something the connection monitor shows may have changed,
+    /// which is what the panel's stream waits on.
+    changes: tokio::sync::watch::Sender<u64>,
 }
 
 fn config_from_db(app_db: &crate::db::Db) -> Config {
@@ -96,7 +100,13 @@ impl Sbmon {
             flushing: AtomicBool::new(false),
             dirty: AtomicBool::new(false),
             wake: tokio::sync::Notify::new(),
+            changes: tokio::sync::watch::channel(0).0,
         })
+    }
+
+    /// Tells the panel's streams to send a fresh frame.
+    fn changed(&self) {
+        self.changes.send_modify(|n| *n = n.wrapping_add(1));
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Engine> {
@@ -147,6 +157,7 @@ impl Sbmon {
 fn reload_config(app: &App) {
     let config = config_from_db(&app.db);
     app.sbmon.lock().config = config;
+    app.sbmon.changed();
 }
 
 // ---- background work -------------------------------------------------------
@@ -170,6 +181,9 @@ pub async fn run(app: Shared) {
             let changed = engine.check_offline(now) | engine.check_status(now, &offline);
             if changed || (ticks.is_multiple_of(6) && sb.dirty.load(Ordering::Acquire)) {
                 sb.persist(&mut engine);
+            }
+            if changed {
+                sb.changed();
             }
             engine.notable != before
         };
@@ -446,8 +460,40 @@ async fn agent_report(State(app): State<Shared>, headers: HeaderMap, body: Bytes
             }
         }
     }
+    if result.is_ok() {
+        sb.changed();
+    }
     match result {
         Ok(value) => agent_json(200, value),
+        Err(engine::Refusal(status, message)) => agent_fail(status, message),
+    }
+}
+
+/// sb-agent 0.7.0's live report, every second while a watched user is online
+/// on that machine. Small and frequent: kept in memory, saved with the rest.
+async fn agent_live(State(app): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+    let Some(body) = json_body(&body) else { return agent_fail(400, "请求内容不是有效 JSON") };
+    let sb = &app.sbmon;
+    let (result, queued) = {
+        let mut engine = sb.lock();
+        let before = engine.notable;
+        let result = engine.live(&bearer(&headers), &body, Utc::now());
+        let queued = engine.notable != before;
+        if queued {
+            sb.persist(&mut engine);
+        } else if result.is_ok() {
+            sb.dirty.store(true, Ordering::Release);
+        }
+        (result, queued)
+    };
+    if queued {
+        sb.wake.notify_one();
+    }
+    match result {
+        Ok(value) => {
+            sb.changed();
+            agent_json(200, value)
+        }
         Err(engine::Refusal(status, message)) => agent_fail(status, message),
     }
 }
@@ -481,6 +527,7 @@ pub fn agent_routes<S: Clone + Send + Sync + 'static>(app: Shared) -> Router<S> 
     Router::new()
         .route(&format!("{API}/agent/register"), post(agent_register))
         .route(&format!("{API}/agent/report"), post(agent_report))
+        .route(&format!("{API}/agent/live"), post(agent_live))
         .route(&format!("{API}/install.sh"), get(|| async { script(INSTALLER) }))
         .route(&format!("{API}/uninstall.sh"), get(|| async { script(UNINSTALLER) }))
         .route(&format!("{API}/bin/{{file}}"), get(agent_binary))
@@ -513,6 +560,53 @@ async fn admin_watch(_: Admin, State(app): State<Shared>) -> Response {
     private(app.sbmon.lock().admin_watch(Utc::now()))
 }
 
+/// The connection monitor's live stream: a frame of the watched rows whenever
+/// a report moves them, at most one a second, and at least one every five
+/// seconds so the page can tell a quiet stream from a dead one.
+async fn watch_stream(State(app): State<Shared>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
+    let Some(session) = socket_session(&app, &headers) else {
+        return answer(StatusCode::UNAUTHORIZED, "登录已失效，请重新登录");
+    };
+    upgrade.on_upgrade(move |socket| stream_watch(app, socket, session))
+}
+
+const STREAM_MIN_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+const STREAM_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(5);
+const STREAM_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn stream_watch(app: Shared, mut socket: WebSocket, session: String) {
+    let mut changes = app.sbmon.changes.subscribe();
+    let mut checked = tokio::time::Instant::now();
+    loop {
+        // Signing out must reach a stream already running.
+        if checked.elapsed() >= STREAM_HEARTBEAT {
+            if !app.db.session_valid(&session) {
+                break;
+            }
+            checked = tokio::time::Instant::now();
+        }
+        let frame = app.sbmon.lock().admin_watch_live(Utc::now()).to_string();
+        changes.mark_unchanged();
+        if !matches!(
+            tokio::time::timeout(STREAM_SEND_TIMEOUT, socket.send(Message::Text(frame.into()))).await,
+            Ok(Ok(()))
+        ) {
+            break;
+        }
+        let sent = tokio::time::Instant::now();
+        // Read too: the browser's close frame is only seen by reading.
+        let closed = tokio::select! {
+            _ = changes.changed() => false,
+            _ = tokio::time::sleep(STREAM_HEARTBEAT) => false,
+            inbound = socket.recv() => matches!(inbound, Some(Ok(Message::Close(_)) | Err(_)) | None),
+        };
+        if closed {
+            break;
+        }
+        tokio::time::sleep_until(sent + STREAM_MIN_GAP).await;
+    }
+}
+
 #[derive(Deserialize)]
 struct NodeBody {
     #[serde(default)]
@@ -543,6 +637,8 @@ fn edit(app: &App, change: impl FnOnce(&mut Engine) -> Result<(), &'static str>)
     match change(&mut engine) {
         Ok(()) => {
             sb.persist(&mut engine);
+            drop(engine);
+            sb.changed();
             ok()
         }
         Err(message) => refuse(message),
@@ -777,6 +873,7 @@ pub fn admin_routes() -> Router<Shared> {
     Router::new()
         .route(&format!("{API}/admin/state"), get(admin_state))
         .route(&format!("{API}/admin/watch"), get(admin_watch))
+        .route(&format!("{API}/admin/watch/stream"), get(watch_stream))
         .route(&format!("{API}/admin/history"), get(history))
         .route(&format!("{API}/admin/userlog"), get(userlog))
         .route(&format!("{API}/admin/config"), get(get_config).put(save_config))

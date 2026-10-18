@@ -37,6 +37,15 @@ sb-agent 0.6.0 起每次上报带上这段时间的连接明细（时间、入�
 - 接口：`GET /api/sbmonitor/v1/admin/userlog?user=&date=&node_id=&q=&probes=1`（`user=?` 查未识别的）。
 - 升级前的连接不会补，日志从各机 sb-agent 升到 0.6.0 那一刻开始。
 
+## 连接监控页实时更新
+
+hub 1.4.1-sb.6 / sb-agent 0.7.0 起，连接监控页不再每 5 秒刷新一次，而是实时跟着上报走：
+
+- **推送**：页面打开后连 WebSocket `admin/watch/stream`，sb-agent 每次上报后 hub 立刻推一帧（最多每秒一帧，没变化时 5 秒一帧当心跳）。连接断了自动重连，期间每 5 秒拉一次；右上角显示「实时 · N 秒前」或「重新连接中」。
+- **在线时每秒上报**：hub 回复上报时告诉 sb-agent 要列哪些监控入站（`watch_tags`），以及这台机器上是否有被监控的用户在线（`fast`）。在线期间 sb-agent 每秒多发一次轻量的 `agent/live`（只读 clash_api 已有的数据，不扫日志、不读 nftables），没人在线就停，15 秒没收到 hub 的确认也自动停。旧 hub 不回这两个字段，0.7.0 的 sb-agent 照旧只做 5 秒一次的常规上报。
+- **新数据**（要开 clash_api）：被监控入站上正在打开的连接（目标、TCP/UDP、开了多久、已用流量，最多 100 条）、每个入站自 sb-agent 启动以来的累计流量。hub 据此算下载 / 上传速度（最近约 4 秒）、本次会话流量；下线记录和 Telegram 下线通知里带上这次的流量。
+- **页面**：每个监控用户一张卡片（在线状态和本次时长按秒走、速度、本次流量、正在连接数、今天的时间轴、正在访问、本次常用），下面是按天分组的会话记录（按服务器筛选、按域名搜索，点开看按网站合并的访问记录）。网站按主域合并（`rr3---sn-xx.googlevideo.com` 算 `googlevideo.com`），推送、校时、证书检查这类系统后台连接默认隐藏。设置收进右上角「设置」。
+
 ## 组成
 
 | 位置 | 说明 |
@@ -45,7 +54,8 @@ sb-agent 0.6.0 起每次上报带上这段时间的连接明细（时间、入�
 | `src/sbmon/mod.rs` | 文件读写、Telegram 发送、定时任务、HTTP 接口 |
 | `src/sbmon/userlog.rs` | 连接日志：按天写入、按用户查询、过期清理 |
 | `src/sbmon/tests.rs` | 从插件的 `tests/plugin.test.js` 移植的用例 |
-| `web-admin/src/components/SingBox.tsx` | 后台的两个页面 |
+| `web-admin/src/components/SingBox.tsx` | 后台的 sing-box 页、连接日志弹窗、监控设置 |
+| `web-admin/src/components/ConnWatch.tsx` | 后台的连接监控页 |
 | `sbmon/agent/` | sb-agent（Go），和插件 0.3.2 的探针一字不差 |
 | `sbmon/installer/` | 落地机的安装 / 卸载脚本 |
 | `sbmon/build-agent.sh` | 编译 sb-agent 到 `sbmon/bin/`，hub 编译时把它嵌进去 |
@@ -65,11 +75,11 @@ sb-agent 0.6.0 起每次上报带上这段时间的连接明细（时间、入�
 
 ## 接口
 
-给 sb-agent（公开，JSON 回复）：`POST agent/register`、`POST agent/report`、`GET install.sh`、`GET uninstall.sh`、`GET bin/{sb-agent-linux-amd64,sb-agent-linux-arm64,checksums.txt}`。
+给 sb-agent（公开，JSON 回复）：`POST agent/register`、`POST agent/report`、`POST agent/live`、`GET install.sh`、`GET uninstall.sh`、`GET bin/{sb-agent-linux-amd64,sb-agent-linux-arm64,checksums.txt}`。
 
 `agent/register` 的 `registration_token` 可以是后台生成的一次性密钥，也可以是 hub 节点的 Token（`install.sh` 用的就是这个），失败次数和 hub 自己的注册一起限流。
 
-后台（要登录，和 hub 其他接口一样拒绝跨站写请求）：`GET admin/state`、`GET admin/watch`、`GET admin/history?node_id=&date=`、`GET/PUT admin/config`、`DELETE admin/config/token`、`POST admin/registration`、`POST admin/node/{rename,alias,delete,link}`、`POST admin/telegram/test`。
+后台（要登录，和 hub 其他接口一样拒绝跨站写请求）：`GET admin/state`、`GET admin/watch`、`GET admin/watch/stream`（WebSocket，只接受面板自己的页面）、`GET admin/history?node_id=&date=`、`GET/PUT admin/config`、`DELETE admin/config/token`、`POST admin/registration`、`POST admin/node/{rename,alias,delete,link}`、`POST admin/telegram/test`。
 
 ## 编译
 

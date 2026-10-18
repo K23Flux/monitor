@@ -51,6 +51,13 @@ fn from_other_origin(headers: &HeaderMap) -> bool {
     headers.get("sec-fetch-site").is_some_and(|site| site != "same-origin")
 }
 
+/// The session behind a panel WebSocket handshake, as `live_ws` judges it: a
+/// valid session cookie sent by the panel's own origin. Used by the sing-box
+/// monitor's stream, which has no public counterpart.
+pub fn socket_session(app: &App, headers: &HeaderMap) -> Option<String> {
+    current_session(headers).filter(|_| !from_other_origin(headers)).filter(|hash| app.db.session_valid(hash))
+}
+
 fn cross_site_write(method: &Method, headers: &HeaderMap) -> bool {
     !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) && from_other_origin(headers)
 }

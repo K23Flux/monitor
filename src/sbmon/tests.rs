@@ -490,3 +490,124 @@ fn traffic_is_booked_per_user() {
     e.delete_node(&node).unwrap();
     assert!(e.state.daily_users.values().all(|n| n.is_empty()));
 }
+
+#[test]
+fn live_reports_follow_a_session_in_real_time() {
+    let (mut e, node, token) = registered("ss2022_alice=alice");
+    let start = t0();
+    let bytes = |up: u64, down: u64| json!([{"tag": "ss2022_alice", "up": up, "down": down}, {"tag": "vless_kim", "up": 9, "down": 9}]);
+    // Nobody online: the agent is told which inbounds to list, but not to hurry.
+    let answer = e.report(&token, &report(&node, json!({"tag_bytes": bytes(100, 1000)})), start).unwrap();
+    assert_eq!(answer["watch_tags"], json!(["ss2022_alice"]));
+    assert_eq!(answer["fast"], false);
+
+    // A first connection: tentative, and now the agent reports every second.
+    let answer = e
+        .report(
+            &token,
+            &report(
+                &node,
+                json!({"activity": activity(1, 1, &[("a.example", start)]), "tag_bytes": bytes(100, 1000)}),
+            ),
+            start,
+        )
+        .unwrap();
+    assert_eq!(answer["fast"], true);
+    assert!(events(&e, "online").is_empty());
+
+    // Live reports carry the speed and the open connections, and confirm the
+    // session once the connection has stayed open long enough.
+    let open = |n: i64| {
+        json!([{"tag": "ss2022_alice", "dst": "A.Example", "net": "TCP", "start": start.timestamp_millis(), "up": 10, "down": n},
+               {"tag": "vless_kim", "dst": "kim.example", "start": 0, "up": 1, "down": 1}])
+    };
+    let live = |at: DateTime<Utc>, up: u64, down: u64| {
+        json!({"node_id": node, "timestamp": at.timestamp_millis(), "live": [{"tag": "ss2022_alice", "live": 1}],
+               "open": open(down as i64), "tag_bytes": bytes(up, down)})
+    };
+    assert_eq!(e.live("wrong", &live(start, 0, 0), start).unwrap_err().0, 401);
+    for s in 1..=16u64 {
+        e.live(
+            &token,
+            &live(start + Duration::seconds(s as i64), 100 + s * 10, 1000 + s * 1000),
+            start + Duration::seconds(s as i64),
+        )
+        .unwrap();
+    }
+    let now = start + Duration::seconds(16);
+    assert_eq!(events(&e, "online").len(), 1, "confirmed by the live reports alone");
+    let r = row(&e, now);
+    assert_eq!(r["online"], true);
+    assert_eq!(r["sessionDown"], 16_000.0);
+    assert_eq!(r["sessionUp"], 160.0);
+    assert_eq!(r["rateDown"], 1000.0);
+    assert_eq!(r["rateUp"], 10.0);
+    assert_eq!(
+        r["open"],
+        json!([{"dst": "a.example", "net": "tcp", "start": start.timestamp_millis(), "up": 10.0, "down": 17000.0}])
+    );
+    assert_eq!(r["sessionVisits"][0]["host"], "a.example");
+    // The live frame is the rows without the events.
+    let frame = e.admin_watch_live(now);
+    assert!(frame.get("events").is_none() && frame["watched"].as_array().unwrap().len() == 1);
+
+    // Quiet agent: the speed falls to zero rather than freezing.
+    assert_eq!(row(&e, now + Duration::seconds(20))["rateDown"], 0.0);
+
+    // Everything closes; after the grace the offline event keeps the traffic
+    // and the alert names it.
+    let closed = json!({"node_id": node, "live": [{"tag": "ss2022_alice", "live": 0}], "open": [], "tag_bytes": bytes(260, 17000)});
+    e.live(&token, &closed, now + Duration::seconds(1)).unwrap();
+    assert_eq!(row(&e, now + Duration::seconds(1))["open"], json!([]));
+    e.state.pending.clear();
+    e.report(&token, &report(&node, json!({"tag_bytes": bytes(260, 17000)})), now + Duration::seconds(75))
+        .unwrap();
+    assert!(e.check_offline(now + Duration::seconds(80)));
+    let off = events(&e, "offline");
+    assert_eq!((off[0].session_up, off[0].session_down), (Some(160.0), Some(16_000.0)));
+    assert!(
+        e.state.pending.iter().any(|p| p.text.contains("流量  ↓ 15.6 KB  ↑ 160 B")),
+        "{:?}",
+        e.state.pending
+    );
+    let r = row(&e, now + Duration::seconds(80));
+    assert_eq!(
+        (r["online"].clone(), r["sessionDown"].clone(), r["open"].clone()),
+        (json!(false), json!(0.0), json!([]))
+    );
+    assert_eq!(
+        e.report(&token, &report(&node, json!({})), now + Duration::seconds(81)).unwrap()["fast"],
+        false
+    );
+
+    // A restarted agent counts from zero again: no negative traffic.
+    e.report(
+        &token,
+        &report(&node, json!({"activity": activity(2, 1, &[("b.example", now)]), "tag_bytes": bytes(5, 50)})),
+        now + Duration::seconds(90),
+    )
+    .unwrap();
+    e.report(&token, &report(&node, json!({"tag_bytes": bytes(15, 150)})), now + Duration::seconds(95))
+        .unwrap();
+    let r = row(&e, now + Duration::seconds(95));
+    assert_eq!((r["sessionUp"].clone(), r["sessionDown"].clone()), (json!(15.0), json!(150.0)));
+}
+
+#[test]
+fn live_reports_stay_away_from_unwatched_servers() {
+    let (mut e, node, token) = registered("ss2022_alice=alice");
+    e.report(&token, &report(&node, json!({"activity": activity(2, 1, &[("a.example", t0())])})), t0())
+        .unwrap();
+    e.set_watch(&node, false).unwrap();
+    let answer = e.report(&token, &report(&node, json!({})), t0() + Duration::seconds(5)).unwrap();
+    assert_eq!((answer["watch_tags"].clone(), answer["fast"].clone()), (json!([]), json!(false)));
+}
+
+#[test]
+fn bytes_read_like_the_panel() {
+    use super::engine::human_bytes;
+    assert_eq!(human_bytes(0.0), "0 B");
+    assert_eq!(human_bytes(1536.0), "1.50 KB");
+    assert_eq!(human_bytes(312.0 * 1024.0 * 1024.0), "312 MB");
+    assert_eq!(human_bytes(1.24 * 1024.0 * 1024.0 * 1024.0), "1.24 GB");
+}
