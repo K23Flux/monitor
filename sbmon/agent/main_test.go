@@ -156,7 +156,7 @@ func TestInboundConnRe(t *testing.T) {
 }
 
 func TestParseProcTCP(t *testing.T) {
-	// Real rows: IPv4-mapped peer on a dual-stack listener, a plain IPv4 row,
+	// Sample rows (documentation addresses): IPv4-mapped peer on a dual-stack listener, a plain IPv4 row,
 	// a LISTEN row and a row on a port nobody watches.
 	data := `  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
    6: 0000000000000000FFFF0000097100CB:9C41 0000000000000000FFFF0000057100CB:D6CA 01 00000000:00000000 02:00002D59 00000000   987        0 7250890 2 0 20 4 31 10 -1
