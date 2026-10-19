@@ -681,6 +681,24 @@ async fn set_watch(_: Admin, State(app): State<Shared>, Json(body): Json<WatchBo
     edit(&app, |e| e.set_watch(&body.node_id, body.enabled))
 }
 
+#[derive(Deserialize)]
+struct UpgradeBody {
+    /// The hub nodes to upgrade; every node with an sb-agent when absent.
+    #[serde(default)]
+    hub_node_ids: Option<Vec<i64>>,
+}
+
+/// Asks the machines' agents to upgrade themselves. Each sb-agent hears it at
+/// its next report, a few seconds on, and runs the hub's own `install.sh
+/// --upgrade` there, which upgrades monitor-agent and sb-agent together. The
+/// body names hub nodes only; what runs is fixed in sb-agent.
+async fn request_upgrade(_: Admin, State(app): State<Shared>, Json(body): Json<UpgradeBody>) -> Response {
+    let (queued, refused) = app.sbmon.lock().request_upgrade(body.hub_node_ids.as_deref(), Utc::now());
+    let refused: Vec<Value> =
+        refused.into_iter().map(|(id, why)| json!({"hubNodeId": id, "reason": why})).collect();
+    Json(json!({"ok": true, "queued": queued, "refused": refused})).into_response()
+}
+
 async fn delete_node(_: Admin, State(app): State<Shared>, Json(body): Json<NodeBody>) -> Response {
     let result = edit(&app, |e| e.delete_node(&body.node_id));
     if result.status().is_success() {
@@ -884,6 +902,7 @@ pub fn admin_routes() -> Router<Shared> {
         .route(&format!("{API}/admin/node/delete"), post(delete_node))
         .route(&format!("{API}/admin/node/link"), post(link_node))
         .route(&format!("{API}/admin/node/watch"), post(set_watch))
+        .route(&format!("{API}/admin/upgrade"), post(request_upgrade))
         .route(&format!("{API}/admin/telegram/test"), post(test_telegram))
 }
 

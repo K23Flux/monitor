@@ -31,7 +31,7 @@ import (
 )
 
 const (
-	version        = "0.7.0"
+	version        = "0.8.0"
 	configFile     = "/etc/sb-agent/config.json"
 	stateFile      = "/var/lib/sb-agent/state.json"
 	singBoxConfig  = "/etc/sing-box/config.json"
@@ -234,6 +234,9 @@ type apiResponse struct {
 	// live report every second. Hubs before 1.4.1-sb.6 send neither.
 	WatchTags []string `json:"watch_tags"`
 	Fast      bool     `json:"fast"`
+	// Upgrade is the panel asking this machine to upgrade its agents; see
+	// startUpgrade. Hubs before 1.4.1-sb.7 never send it.
+	Upgrade bool `json:"upgrade"`
 }
 
 var httpClient = &http.Client{
@@ -543,6 +546,9 @@ func collectAndReport(cfg *Config, state *AgentState) error {
 		return errors.New(response.Error)
 	}
 	liveMode.set(response.WatchTags, response.Fast)
+	if response.Upgrade {
+		startUpgrade(cfg.Server)
+	}
 	tracker.commit()
 	clashUsage.commit()
 	if state.LastLogUnix == 0 || now.Unix()-state.LastLogUnix >= 30 {
@@ -1973,6 +1979,9 @@ func liveLoop(ctx context.Context, cfg Config) {
 		}
 		failures = 0
 		liveMode.set(response.WatchTags, response.Fast)
+		if response.Upgrade {
+			startUpgrade(cfg.Server)
+		}
 	}
 }
 

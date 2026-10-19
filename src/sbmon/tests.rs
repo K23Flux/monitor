@@ -611,3 +611,41 @@ fn bytes_read_like_the_panel() {
     assert_eq!(human_bytes(312.0 * 1024.0 * 1024.0), "312 MB");
     assert_eq!(human_bytes(1.24 * 1024.0 * 1024.0 * 1024.0), "1.24 GB");
 }
+
+/// A linked node reporting as sb-agent `version`, for the upgrade request.
+fn linked_reporting(e: &mut Engine, hub: i64, version: &str, now: DateTime<Utc>) -> (String, String) {
+    let made = e.register_linked(hub, "n", &json!({}), now);
+    let id = made["node_id"].as_str().unwrap().to_owned();
+    let token = made["agent_token"].as_str().unwrap().to_owned();
+    e.report(&token, &report(&id, json!({"agent_version": version})), now).unwrap();
+    (id, token)
+}
+
+#[test]
+fn an_upgrade_request_reaches_a_current_sb_agent_once() {
+    let mut e = Engine::new(State::default(), Config::default());
+    let (id, token) = linked_reporting(&mut e, 7, "0.8.0", t0());
+    let (queued, refused) = e.request_upgrade(Some(&[7]), t0());
+    assert_eq!((queued, refused.len()), (vec![7], 0));
+    let told = e.report(&token, &report(&id, json!({"agent_version": "0.8.0"})), t0()).unwrap();
+    assert_eq!(told["upgrade"], true);
+    // Spent by being told: the next report carries nothing.
+    let next = e.report(&token, &report(&id, json!({"agent_version": "0.8.0"})), t0()).unwrap();
+    assert_eq!(next["upgrade"], false);
+}
+
+#[test]
+fn an_upgrade_request_is_refused_where_it_would_do_nothing() {
+    let mut e = Engine::new(State::default(), Config::default());
+    linked_reporting(&mut e, 1, "0.7.0", t0());
+    linked_reporting(&mut e, 2, "0.8.0", t0());
+    // 3: no sb-agent at all. 1: too old to understand it. 2: reported long ago.
+    let later = t0() + Duration::hours(1);
+    let (queued, refused) = e.request_upgrade(Some(&[1, 2, 3]), later);
+    assert!(queued.is_empty());
+    assert_eq!(refused.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![1, 2, 3]);
+    // Asking for none in particular asks every node that can, and no more.
+    let (queued, refused) = e.request_upgrade(None, t0());
+    assert_eq!(queued, vec![2]);
+    assert_eq!(refused.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![1]);
+}

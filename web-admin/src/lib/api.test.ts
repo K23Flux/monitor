@@ -1,6 +1,6 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
-import { badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, shortAddress, trafficCorrection } from "./api.ts"
+import { badIfaceName, behind, hubBehind, selfUpgradeable, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, shortAddress, trafficCorrection } from "./api.ts"
 
 assert.deepEqual(changes({ public: true, price: 5 }, { price: 20 }), { price: 20 })
 assert.deepEqual(changes({ total_rx: "100", month_tx: "2" }, { total_rx: "100", month_tx: "3" }), { month_tx: "3" })
@@ -43,6 +43,21 @@ assert.deepEqual(outdatedAgents([{ agent_version: "1.2.0-dev" }], "1.2.0"), [{ a
 assert.equal(behind("1.2.0", "1.10.0"), true)
 assert.equal(behind("1.3.0", "1.2.0"), false)
 assert.equal(behind("1.2.0", ""), false)
+
+// This fork's hub compares its own counter as well as the upstream version.
+assert.equal(hubBehind("1.4.1-sb.6", "1.4.1-sb.7"), true)
+assert.equal(hubBehind("1.4.1-sb.6", "1.5.0"), true)
+assert.equal(hubBehind("1.4.1-sb.7", "1.4.1-sb.7"), false)
+assert.equal(hubBehind("1.5.0-sb.1", "1.4.9-sb.9"), false)
+assert.equal(hubBehind("1.4.1-sb.6", ""), false)
+assert.equal(hubBehind("1.4.1-sb.6", "nightly"), false)
+
+// Only an sb-agent from 0.8.0 on understands the upgrade request.
+assert.equal(selfUpgradeable("0.7.0"), false)
+assert.equal(selfUpgradeable("0.8.0"), true)
+assert.equal(selfUpgradeable("0.10.2"), true)
+assert.equal(selfUpgradeable("1.0.0"), true)
+assert.equal(selfUpgradeable(""), false)
 
 // An emptied traffic field means the counter is not to be corrected. Sent as 0
 // it would clear a lifetime total, which must never decrease.

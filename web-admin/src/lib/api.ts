@@ -325,6 +325,34 @@ export function behind(current: string, latest: string): boolean {
   return false
 }
 
+/**
+ * `behind` for this fork's own hub releases, where the `-sb.N` counter matters:
+ * `1.4.1-sb.6` is behind `1.4.1-sb.7`, though both are upstream 1.4.1. Compared
+ * against upstream's plain `1.5.0`, a fork build is on that version's `-sb.0`.
+ */
+export function hubBehind(current: string, latest: string): boolean {
+  if (!current || !latest) return false
+  const split = (v: string): [number[], number] | null => {
+    const m = v.match(/^(\d+(?:\.\d+)*)(?:-sb\.(\d+))?$/)
+    return m ? [m[1].split(".").map(Number), Number(m[2] ?? 0)] : null
+  }
+  const a = split(current)
+  const b = split(latest)
+  if (!a || !b) return false
+  for (let i = 0; i < Math.max(a[0].length, b[0].length); i++) {
+    if ((a[0][i] ?? 0) !== (b[0][i] ?? 0)) return (a[0][i] ?? 0) < (b[0][i] ?? 0)
+  }
+  return a[1] < b[1]
+}
+
+/** Whether an sb-agent of this version acts on the hub's upgrade request (0.8.0 on). */
+export function selfUpgradeable(version: string): boolean {
+  const m = version.match(/^v?(\d+)\.(\d+)\.(\d+)/)
+  if (!m) return false
+  const [a, b, c] = [Number(m[1]), Number(m[2]), Number(m[3])]
+  return a > 0 || b > 8 || (b === 8 && c >= 0)
+}
+
 /** The nodes running an earlier agent than the published one. */
 export function outdatedAgents<T extends { agent_version: string }>(nodes: T[], latest: string): T[] {
   return nodes.filter((n) => behind(n.agent_version, latest))

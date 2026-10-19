@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-pub const VERSION: &str = "0.7.0";
+pub const VERSION: &str = "0.8.0";
 
 const MAX_EVENTS: usize = 500;
 const MAX_USER_EVENTS: usize = 300;
@@ -518,7 +518,16 @@ pub struct Engine {
     /// at once; everything else waits for the next periodic save. A counter
     /// rather than the queue's length, which stops growing at its cap.
     pub notable: u64,
+    /// sb-agents the panel asked to upgrade themselves, told at their next
+    /// report. Held in memory only and cleared once told: a request that went
+    /// unanswered because the machine was off must not fire days later, and one
+    /// that keeps failing must not be retried forever.
+    pub upgrades: BTreeSet<String>,
 }
+
+/// The first sb-agent that understands the upgrade request. An older one ignores
+/// the field, so asking it would report success to the panel and do nothing.
+pub const UPGRADE_FROM: (u64, u64, u64) = (0, 8, 0);
 
 fn watch_key(node_id: &str, tag: &str) -> String {
     format!("{node_id}:{tag}")
@@ -588,6 +597,15 @@ fn human_duration(from: &str, to: &str) -> String {
     } else {
         format!("{seconds}s")
     }
+}
+
+/// Whether an sb-agent of this version acts on the upgrade request.
+fn can_upgrade_itself(version: &str) -> bool {
+    let mut parts = version.trim_start_matches('v').split(['.', '-']).map(|p| p.parse::<u64>());
+    let (Some(Ok(a)), Some(Ok(b)), Some(Ok(c))) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    (a, b, c) >= UPGRADE_FROM
 }
 
 /// Bytes as the panel shows them: 1024-based, three significant figures.
@@ -671,7 +689,7 @@ struct Activity {
 
 impl Engine {
     pub fn new(state: State, config: Config) -> Self {
-        Self { state, config, notable: 0 }
+        Self { state, config, notable: 0, upgrades: BTreeSet::new() }
     }
 
     fn push_user_event(
@@ -990,7 +1008,9 @@ impl Engine {
     /// What the agent is told after a report: which inbounds to list open
     /// connections for, and whether to send a live report every second (a
     /// watched user is online, or about to be, on this machine).
-    fn agent_answer(&self, node_id: &str, now_iso: &str) -> Value {
+    fn agent_answer(&mut self, node_id: &str, now_iso: &str) -> Value {
+        // Told once, here: the request is spent by being delivered.
+        let upgrade = self.upgrades.remove(node_id);
         let node = self.state.nodes.get(node_id);
         let watching = node.is_some_and(|n| !n.watch_off);
         let tags: Vec<&String> = if watching {
@@ -1003,7 +1023,7 @@ impl Engine {
         };
         let fast =
             watching && self.state.watch.values().any(|w| w.node_id == node_id && (w.online || w.pending));
-        json!({"ok": true, "server_time": now_iso, "watch_tags": tags, "fast": fast})
+        json!({"ok": true, "server_time": now_iso, "watch_tags": tags, "fast": fast, "upgrade": upgrade})
     }
 
     /// A live report (sb-agent 0.7.0 `agent/live`, every second while a watched
@@ -1696,6 +1716,41 @@ impl Engine {
 
     /// Switches watching users on this server on or off. Switched off, any
     /// session in progress there is dropped without an alert.
+    /// Asks the sb-agents behind the given hub nodes (`None` for every one that
+    /// can) to upgrade the machine's agents. Returns the hub node ids queued and,
+    /// for each one refused, why: a node with no sb-agent, an sb-agent too old to
+    /// understand the request, or one that is not reporting and so would never
+    /// hear it.
+    pub fn request_upgrade(
+        &mut self,
+        hub_ids: Option<&[i64]>,
+        now: DateTime<Utc>,
+    ) -> (Vec<i64>, Vec<(i64, &'static str)>) {
+        let mut queued = Vec::new();
+        let mut refused = Vec::new();
+        let mut ask = Vec::new();
+        let wanted: Vec<i64> = match hub_ids {
+            Some(ids) => ids.to_vec(),
+            None => self.state.nodes.values().filter_map(|n| n.hub_node_id).collect(),
+        };
+        for hub in wanted {
+            let Some(node) = self.state.nodes.values().find(|n| n.hub_node_id == Some(hub)) else {
+                refused.push((hub, "这台机器没装 sing-box 监控，请用命令手动升级"));
+                continue;
+            };
+            if !can_upgrade_itself(&node.agent_version) {
+                refused.push((hub, "这台机器的 sb-agent 太旧，不认升级指令，先用命令手动升一次"));
+            } else if !self.node_online(node, now) {
+                refused.push((hub, "这台机器的 sb-agent 没在汇报，收不到指令"));
+            } else {
+                queued.push(hub);
+                ask.push(node.id.clone());
+            }
+        }
+        self.upgrades.extend(ask);
+        (queued, refused)
+    }
+
     pub fn set_watch(&mut self, node_id: &str, enabled: bool) -> Result<(), &'static str> {
         let node = self.state.nodes.get_mut(node_id).ok_or("节点不存在")?;
         node.watch_off = !enabled;

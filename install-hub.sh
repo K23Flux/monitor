@@ -1,7 +1,7 @@
 #!/bin/sh
 # monitor hub installer.
 #
-#   curl -fsSL https://github.com/monitor-probe/monitor/releases/latest/download/install-hub.sh -o install-hub.sh
+#   curl -fsSL https://github.com/K23Flux/monitor/releases/latest/download/install-hub.sh -o install-hub.sh
 #   chmod +x install-hub.sh
 #   sudo ./install-hub.sh
 #
@@ -14,7 +14,9 @@ set -eu
 # Debian does not set it.
 PATH="$PATH:/usr/sbin:/sbin"
 
-REPO="monitor-probe/monitor"
+# This fork's hub is published from its own repository: upstream's release does
+# not carry the sing-box monitor, so installing it would silently drop that.
+REPO="K23Flux/monitor"
 SERVICE="monitor-hub"
 UNIT="/etc/systemd/system/monitor-hub.service"
 # Everything but the unit lives under one directory: the two binaries at the top,

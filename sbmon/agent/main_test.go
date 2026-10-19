@@ -544,3 +544,51 @@ func TestLiveModeLapses(t *testing.T) {
 		t.Fatal("slow keeps the tags")
 	}
 }
+
+func TestUpgradeRunsOutsideTheServiceUnderSystemd(t *testing.T) {
+	now := time.Unix(1_760_000_000, 0)
+	cmd := upgradeCommand("https://hub.example.com", true, now)
+	if cmd.Args[0] != "systemd-run" {
+		t.Fatalf("under systemd the upgrade must be a transient unit, got %v", cmd.Args)
+	}
+	if !strings.Contains(strings.Join(cmd.Args, " "), "--unit sb-agent-upgrade-1760000000") {
+		t.Fatalf("unit name should carry the time so a second request cannot collide: %v", cmd.Args)
+	}
+}
+
+func TestUpgradeWithoutSystemdGetsItsOwnSession(t *testing.T) {
+	cmd := upgradeCommand("https://hub.example.com", false, time.Now())
+	if cmd.Args[0] != "sh" || cmd.SysProcAttr == nil || !cmd.SysProcAttr.Setsid {
+		t.Fatalf("expected a setsid shell, got %v", cmd.Args)
+	}
+}
+
+func TestUpgradeHandsTheHubAddressOverAsAnArgumentNotAsShellText(t *testing.T) {
+	hostile := `https://hub.example.com"; touch /tmp/pwned; echo "`
+	for _, systemd := range []bool{true, false} {
+		cmd := upgradeCommand(hostile, systemd, time.Now())
+		script := ""
+		for i, arg := range cmd.Args {
+			if arg == "-c" {
+				script = cmd.Args[i+1]
+			}
+		}
+		if strings.Contains(script, "hub.example.com") || strings.Contains(script, "pwned") {
+			t.Fatalf("the address must not be spliced into the script: %q", script)
+		}
+		if cmd.Args[len(cmd.Args)-1] != hostile {
+			t.Fatalf("the address should be the last argument, got %v", cmd.Args)
+		}
+	}
+}
+
+func TestUpgradeResponseFieldIsDecoded(t *testing.T) {
+	var response apiResponse
+	if err := json.Unmarshal([]byte(`{"ok":true,"upgrade":true}`), &response); err != nil || !response.Upgrade {
+		t.Fatalf("upgrade flag not decoded: %v %+v", err, response)
+	}
+	response = apiResponse{}
+	if err := json.Unmarshal([]byte(`{"ok":true}`), &response); err != nil || response.Upgrade {
+		t.Fatalf("an older hub sends no flag: %v %+v", err, response)
+	}
+}

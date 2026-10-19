@@ -16,7 +16,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
+import { api, badIfaceName, behind, hubBehind, selfUpgradeable, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
 import { bytes, cycleMonths, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -804,11 +804,13 @@ function GroupDialog({ nodes, onClose, onSaved }: { nodes: Node[]; onClose: () =
   )
 }
 
-function ConfirmDialog({ title, description, confirmLabel, busy = false, onClose, onConfirm, children }: {
+function ConfirmDialog({ title, description, confirmLabel, busy = false, tone = "destructive", onClose, onConfirm, children }: {
   title: string
   description: string
   confirmLabel: string
   busy?: boolean
+  /** Red by default, for what cannot be undone; an upgrade is not that. */
+  tone?: "destructive" | "default"
   onClose: () => void
   onConfirm: () => void
   children?: React.ReactNode
@@ -823,7 +825,7 @@ function ConfirmDialog({ title, description, confirmLabel, busy = false, onClose
         {children}
         <DialogFooter className="border-t pt-4">
           <Button variant="ghost" onClick={onClose}>取消</Button>
-          <Button variant="destructive" onClick={onConfirm} disabled={busy}>{confirmLabel}</Button>
+          <Button variant={tone} onClick={onConfirm} disabled={busy}>{confirmLabel}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -1246,7 +1248,14 @@ function upgradeCommand(site: string) {
   return scriptCommand(site, () => ["--upgrade"])
 }
 
-export type Versions = { hub: string; hub_latest: string; agent_latest: string; notice: boolean }
+export type Versions = {
+  hub: string
+  hub_latest: string
+  agent_latest: string
+  notice: boolean
+  /** Whether the hub's root helper is installed, and how its last run went. */
+  hub_upgrade: { ready: boolean; status: string }
+}
 
 /**
  * What is running and what is published. Read once per panel load: the hub holds
@@ -3516,11 +3525,17 @@ function Data() {
   )
 }
 
-const releaseUrl = (repo: string, version: string) => `https://github.com/monitor-probe/${repo}/releases/tag/v${version}`
+// The hub is this fork's own release; the agent is upstream's.
+const releaseUrl = (repo: string, version: string) =>
+  `https://github.com/${repo === "monitor" ? "K23Flux" : "monitor-probe"}/${repo}/releases/tag/v${version}`
 
 /** `v1.2.0 → v1.3.0` when something is published, the running version alone otherwise. */
-function VersionPair({ current, latest }: { current: string; latest: string }) {
-  if (!behind(current, latest)) {
+function VersionPair({ current, latest, isBehind = behind }: {
+  current: string
+  latest: string
+  isBehind?: (current: string, latest: string) => boolean
+}) {
+  if (!isBehind(current, latest)) {
     return <span className="text-xs text-muted-foreground">{latest ? `已是最新 v${current}` : `当前 v${current}`}</span>
   }
   return (
@@ -3546,6 +3561,11 @@ function byVersion(nodes: Node[]): [string, Node[]][] {
  * The hub card names the release alone: how to take it depends on how the hub
  * was installed, script or container, which the hub cannot tell.
  */
+/** What the sing-box monitor knows of a machine, as far as upgrading it goes. */
+type SbUpgradeNode = { hubNodeId: number | null; agentVersion: string; online: boolean }
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
 function Update({ versions, reload, nodes, site, refusal }: {
   versions: Versions | null
   reload: () => void
@@ -3554,8 +3574,21 @@ function Update({ versions, reload, nodes, site, refusal }: {
   refusal: string
 }) {
   const [saving, setSaving] = useState(false)
+  // Which machines can be told to upgrade themselves: those whose sb-agent is
+  // new enough to understand it and is reporting. The rest keep the command.
+  const [sb, setSb] = useState<SbUpgradeNode[]>([])
+  const [asking, setAsking] = useState<"hub" | "nodes" | number | null>(null)
+  const [confirming, setConfirming] = useState<"hub" | "nodes" | null>(null)
+  useEffect(() => {
+    api<{ nodes: SbUpgradeNode[] }>("/sbmonitor/v1/admin/state").then((r) => setSb(r.nodes)).catch(() => {})
+  }, [nodes])
   if (!versions) return null
   const outdated = outdatedAgents(nodes, versions.agent_latest)
+  const selfUpgrade = (n: Node) => {
+    const m = sb.find((x) => x.hubNodeId === n.id)
+    return !!m && m.online && selfUpgradeable(m.agentVersion)
+  }
+  const askable = outdated.filter(selfUpgrade)
   const offline = outdated.filter((n) => !n.online).length
   const upgrade = refusal ? "" : upgradeCommand(site)
   const unreachable = !versions.hub_latest && !versions.agent_latest
@@ -3573,8 +3606,82 @@ function Update({ versions, reload, nodes, site, refusal }: {
     }
   }
 
+  // The hub only leaves a request for its root helper, then restarts. Watch the
+  // version it reports until it is the one asked for, tolerating the stretch
+  // where it does not answer at all.
+  async function upgradeHub() {
+    setConfirming(null)
+    setAsking("hub")
+    try {
+      const { latest } = await api<{ latest: string }>("/hub/upgrade", { method: "POST", body: "{}" })
+      toast.success(`已请求升级到 v${latest}，hub 会短暂重启`)
+      for (let i = 0; i < 60; i++) {
+        await sleep(4000)
+        try {
+          const v = await api<Versions>("/version")
+          if (v.hub_upgrade.status.startsWith("failed")) {
+            toast.error(`hub 升级没成功：${v.hub_upgrade.status.replace(/^failed:\s*/, "")}`)
+            break
+          }
+          if (v.hub === latest) {
+            toast.success(`hub 已升级到 v${latest}`)
+            break
+          }
+        } catch {
+          // Restarting.
+        }
+      }
+      reload()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setAsking(null)
+    }
+  }
+
+  // Each sb-agent hears the request at its next report, a few seconds on, and
+  // upgrades both agents on its machine from there.
+  async function upgradeNodes(targets: Node[], who: "nodes" | number) {
+    setConfirming(null)
+    setAsking(who)
+    try {
+      const r = await api<{ queued: number[]; refused: { hubNodeId: number; reason: string }[] }>(
+        "/sbmonitor/v1/admin/upgrade",
+        { method: "POST", body: JSON.stringify({ hub_node_ids: targets.map((n) => n.id) }) },
+      )
+      if (r.queued.length) toast.success(`已通知 ${r.queued.length} 台升级，一分钟左右后版本会更新`)
+      for (const x of r.refused) {
+        toast.error(`${nodes.find((n) => n.id === x.hubNodeId)?.name ?? x.hubNodeId}：${x.reason}`)
+      }
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setAsking(null)
+    }
+  }
+
   return (
     <div className="space-y-4">
+      {confirming === "hub" && (
+        <ConfirmDialog
+          title="升级 hub？"
+          description={`将升级到 v${versions.hub_latest}。升级前会备份数据目录和 compose 文件，hub 会重启一下，各节点的 agent 自动重连。拉不到镜像或新版本起不来时会自动回到现在的版本。`}
+          confirmLabel="升级"
+          tone="default"
+          onClose={() => setConfirming(null)}
+          onConfirm={upgradeHub}
+        />
+      )}
+      {confirming === "nodes" && (
+        <ConfirmDialog
+          title={`升级 ${askable.length} 台节点？`}
+          description="这些机器会各自重新安装 monitor-agent，装了 sing-box 监控的会一起升级 sb-agent，期间会掉线几秒。先升级 hub 再升级节点，节点才能拿到新版 sb-agent。"
+          confirmLabel="升级"
+          tone="default"
+          onClose={() => setConfirming(null)}
+          onConfirm={() => upgradeNodes(askable, "nodes")}
+        />
+      )}
       {unreachable && (
         <Card className="p-5">
           <p className="text-sm text-muted-foreground">
@@ -3587,16 +3694,28 @@ function Update({ versions, reload, nodes, site, refusal }: {
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h3 className="text-sm font-medium">hub</h3>
           <div className="flex items-center gap-3">
-            <VersionPair current={versions.hub} latest={versions.hub_latest} />
-            {behind(versions.hub, versions.hub_latest) && (
-              <Button size="sm" variant="ghost" asChild>
-                <a href={releaseUrl("monitor", versions.hub_latest)} target="_blank" rel="noreferrer">
-                  发布说明
-                </a>
-              </Button>
+            <VersionPair current={versions.hub} latest={versions.hub_latest} isBehind={hubBehind} />
+            {hubBehind(versions.hub, versions.hub_latest) && (
+              <>
+                <Button size="sm" variant="ghost" asChild>
+                  <a href={releaseUrl("monitor", versions.hub_latest)} target="_blank" rel="noreferrer">
+                    发布说明
+                  </a>
+                </Button>
+                {versions.hub_upgrade.ready && (
+                  <Button size="sm" disabled={asking === "hub"} onClick={() => setConfirming("hub")}>
+                    <ArrowUpCircle className="size-4" /> {asking === "hub" ? "升级中…" : "升级 hub"}
+                  </Button>
+                )}
+              </>
             )}
           </div>
         </div>
+        {hubBehind(versions.hub, versions.hub_latest) && !versions.hub_upgrade.ready && (
+          <p className="text-xs leading-relaxed text-muted-foreground">
+            hub 所在的机器上还没装升级助手。装一次（scripts/upgrade-hub-docker.sh，做法见 sbmon/README.md）之后，这里就能一键升级；在那之前改 compose 里的镜像版本再 docker compose up -d。
+          </p>
+        )}
       </Card>
 
       <Card className="gap-4 p-5">
@@ -3615,12 +3734,20 @@ function Update({ versions, reload, nodes, site, refusal }: {
         {(outdated.length > 0 || !versions.agent_latest) && (
           <>
             <p className="text-xs leading-relaxed text-muted-foreground">
-              以 root 在每台机器上执行一次。不含凭证，沿用机器上已有的设置，不会新建节点。
+              {askable.length > 0
+                ? "下面带 ↑ 的节点装了 sing-box 监控，可以直接点名升级；其余的，以及升级没动静的，以 root 在机器上执行下面的命令。"
+                : "以 root 在每台机器上执行一次。"}
+              不含凭证，沿用机器上已有的设置，不会新建节点。
             </p>
             {upgrade ? (
               <>
                 <Command>{upgrade}</Command>
                 <div className="flex flex-wrap gap-2">
+                  {askable.length > 0 && (
+                    <Button size="sm" disabled={asking !== null} onClick={() => setConfirming("nodes")}>
+                      <ArrowUpCircle className="size-4" /> {asking === "nodes" ? "已通知…" : `一键升级 ${askable.length} 台`}
+                    </Button>
+                  )}
                   <Button size="sm" variant="secondary" onClick={() => copy(upgrade)}>
                     <Copy className="size-4" /> 复制命令
                   </Button>
@@ -3657,16 +3784,31 @@ function Update({ versions, reload, nodes, site, refusal }: {
                     <div key={version} className="space-y-1.5">
                       <div className="text-xs text-muted-foreground">v{version} · {group.length} 台</div>
                       <div className="flex flex-wrap gap-1.5">
-                        {group.map((n) => (
-                          <Badge
-                            key={n.id}
-                            variant="secondary"
-                            className={`font-normal ${n.online ? "" : "opacity-50"}`}
-                            title={n.online ? undefined : "离线"}
-                          >
-                            {n.name}
-                          </Badge>
-                        ))}
+                        {group.map((n) =>
+                          selfUpgrade(n) ? (
+                            <button
+                              key={n.id}
+                              type="button"
+                              disabled={asking !== null}
+                              onClick={() => upgradeNodes([n], n.id)}
+                              title="点击升级这台"
+                              className="rounded-full outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:opacity-50"
+                            >
+                              <Badge variant="secondary" className="cursor-pointer font-normal hover:bg-secondary/70">
+                                {n.name} ↑
+                              </Badge>
+                            </button>
+                          ) : (
+                            <Badge
+                              key={n.id}
+                              variant="secondary"
+                              className={`font-normal ${n.online ? "" : "opacity-50"}`}
+                              title={n.online ? undefined : "离线"}
+                            >
+                              {n.name}
+                            </Badge>
+                          ),
+                        )}
                       </div>
                     </div>
                   ))}
@@ -3725,7 +3867,7 @@ export function Admin({
   // page, or when the lookup failed and the page has nothing to say.
   const updates =
     !!versions?.notice
-    && (behind(versions.hub, versions.hub_latest) || outdatedAgents(nodes, versions.agent_latest).length > 0)
+    && (hubBehind(versions.hub, versions.hub_latest) || outdatedAgents(nodes, versions.agent_latest).length > 0)
   return (
     <div className="flex flex-col gap-6 md:flex-row">
       <nav className="flex gap-1 overflow-x-auto md:w-44 md:shrink-0 md:flex-col md:overflow-visible">

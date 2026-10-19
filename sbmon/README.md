@@ -46,6 +46,15 @@ hub 1.4.1-sb.6 / sb-agent 0.7.0 起，连接监控页不再每 5 秒刷新一次
 - **新数据**（要开 clash_api）：被监控入站上正在打开的连接（目标、TCP/UDP、开了多久、已用流量，最多 100 条）、每个入站自 sb-agent 启动以来的累计流量。hub 据此算下载 / 上传速度（最近约 4 秒）、本次会话流量；下线记录和 Telegram 下线通知里带上这次的流量。
 - **页面**：每个监控用户一张卡片（在线状态和本次时长按秒走、速度、本次流量、正在连接数、今天的时间轴、正在访问、本次常用），下面是按天分组的会话记录（按服务器筛选、按域名搜索，点开看按网站合并的访问记录）。网站按主域合并（`rr3---sn-xx.googlevideo.com` 算 `googlevideo.com`），推送、校时、证书检查这类系统后台连接默认隐藏。设置收进右上角「设置」。
 
+## 后台一键升级
+
+hub 1.4.1-sb.7 / sb-agent 0.8.0 起，后台「更新」页可以直接升级 hub 和节点，不用再逐台 SSH：
+
+- **hub**：hub 在容器里以低权限跑，改不了自己的 compose 文件，也碰不到 docker，所以点「升级 hub」只是在数据目录留一个 `upgrade.request`（里面只有目标版本号），由宿主机上 root 的 systemd 路径单元接手，执行 `scripts/upgrade-hub-docker.sh`：备份数据目录和 compose 文件 → 把 compose 里唯一的 `image: ghcr.io/k23flux/monitor:<版本>` 改成新版本 → `docker compose pull` → `up -d` → 等新 hub 应答；拉不到镜像就还原文件、不动现有 hub，起不来就回滚并重新 `up -d`。结果在数据目录的 `upgrade.status`，过程在 `/var/log/monitor-hub-upgrade.log`。请求文件里除了符合 `1.4.1` / `1.4.1-sb.7` 形式的版本号，其它内容一概不认，镜像名固定。版本检查和升级源都是 `K23Flux/monitor` 的发布，不是上游。**宿主机上装一次**：把脚本放到机器上（不能用管道），`sudo sh upgrade-hub-docker.sh install --dir /opt/apps/monitor`（`--health` 默认 `http://127.0.0.1:28080/api/me`，`--backups` 默认 `/root`）；装好后后台才会出现「升级 hub」按钮。卸载：`sudo sh upgrade-hub-docker.sh uninstall`。测试：`scripts/test-upgrade-hub-docker.sh`（用假的 docker 跑安装、升级、拉取失败、回滚、非法请求）。
+- **节点**：hub 在 sb-agent 上报的回复里带 `upgrade: true`，sb-agent 在本机跑 hub 的 `install.sh --upgrade`（monitor-agent 和 sb-agent 一起升级）。回复里只有一个布尔值，命令固定写在 sb-agent 里，地址取自本机配置；systemd 机器用 `systemd-run` 起独立单元（安装器会重启 sb-agent，不能是它的子进程），其它走 `setsid`，输出在 `/var/log/sb-agent-upgrade.log`，10 分钟内只执行一次。
+- **限制**：sb-agent 低于 0.8.0 听不懂这个字段，要先用页面上的命令手动升一次；没装 sing-box 的机器没有 sb-agent，一直用命令。顺序是先升 hub，再升节点，因为节点的 sb-agent 二进制是 hub 内嵌下发的。
+- 接口：`POST /api/hub/upgrade`；`POST /api/sbmonitor/v1/admin/upgrade`，body `{"hub_node_ids":[1,2]}`，不带则请求所有能升级的节点。
+
 ## 组成
 
 | 位置 | 说明 |
@@ -58,6 +67,7 @@ hub 1.4.1-sb.6 / sb-agent 0.7.0 起，连接监控页不再每 5 秒刷新一次
 | `web-admin/src/components/ConnWatch.tsx` | 后台的连接监控页 |
 | `sbmon/agent/` | sb-agent（Go），和插件 0.3.2 的探针一字不差 |
 | `sbmon/installer/` | 落地机的安装 / 卸载脚本 |
+| `scripts/upgrade-hub-docker.sh` | 宿主机上的 hub 升级助手（Docker 部署），后台「升级 hub」靠它；`scripts/test-upgrade-hub-docker.sh` 是它的测试 |
 | `sbmon/build-agent.sh` | 编译 sb-agent 到 `sbmon/bin/`，hub 编译时把它嵌进去 |
 
 ## 和 Komari 插件的兼容

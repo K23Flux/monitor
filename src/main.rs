@@ -81,6 +81,9 @@ pub struct App {
     pub site: String,
     /// Parent directory containing one folder per installed public theme.
     pub themes: PathBuf,
+    /// The directory holding the database, where the hub leaves its upgrade
+    /// request for the root helper; see `api::upgrade_hub`.
+    pub data: PathBuf,
     /// Alerts on their way out; see `notify::send`.
     pub notes: tokio::sync::mpsc::Sender<notify::Note>,
     /// The latest published tags, as last read from GitHub. Filled when the panel
@@ -105,6 +108,7 @@ impl App {
         db: Db,
         site: String,
         themes: PathBuf,
+        data: PathBuf,
         notes: tokio::sync::mpsc::Sender<notify::Note>,
         sbmon: sbmon::Sbmon,
     ) -> Self {
@@ -121,6 +125,7 @@ impl App {
                 .expect("http client"),
             site,
             themes,
+            data,
             notes,
             releases: Mutex::default(),
             sbmon,
@@ -131,8 +136,15 @@ impl App {
     pub fn for_test(db: Db) -> Self {
         // Nothing delivers in tests; `notify::send` drops into the closed channel.
         let dir = std::env::temp_dir().join(format!("sbmon-test-{}", auth::random_token()));
-        let sbmon = sbmon::Sbmon::open(dir, &db).expect("sbmon state");
-        Self::new(db, String::new(), PathBuf::from("themes"), tokio::sync::mpsc::channel(1).0, sbmon)
+        let sbmon = sbmon::Sbmon::open(dir.clone(), &db).expect("sbmon state");
+        Self::new(
+            db,
+            String::new(),
+            PathBuf::from("themes"),
+            dir.clone(),
+            tokio::sync::mpsc::channel(1).0,
+            sbmon,
+        )
     }
 
     pub fn public_page(&self) -> bool {
@@ -167,9 +179,11 @@ fn forwarded_proto(headers: &HeaderMap) -> Option<&str> {
 
 /// Where the agent binaries are published, and where this hub is published. Not
 /// settings: redirecting either implies a fork, which rebuilds these lines
-/// anyway.
+/// anyway. This fork's hub is published from its own repository, so the panel
+/// checks and upgrades against that rather than against upstream, whose release
+/// does not carry the sing-box monitor.
 pub const AGENT_REPO: &str = "monitor-probe/agent";
-pub const HUB_REPO: &str = "monitor-probe/monitor";
+pub const HUB_REPO: &str = "K23Flux/monitor";
 
 /// The one-line installer pasted onto a new VPS.
 async fn install_script() -> Response {
@@ -334,6 +348,8 @@ struct Args {
     database: String,
     site: String,
     themes: PathBuf,
+    /// The directory the database sits in.
+    data: PathBuf,
     /// Where the sing-box monitor keeps `state.json` and `history/`.
     sbmon_dir: PathBuf,
     reset_password: bool,
@@ -411,6 +427,7 @@ fn parse_args() -> Result<Args> {
         database,
         site: site.trim_end_matches('/').to_owned(),
         themes,
+        data: beside,
         sbmon_dir,
         reset_password,
     })
@@ -481,7 +498,7 @@ async fn main() -> Result<()> {
     let (notes, inbox) = tokio::sync::mpsc::channel(notify::QUEUE);
     let db = Db::open(&args.database)?;
     let sbmon = sbmon::Sbmon::open(args.sbmon_dir, &db)?;
-    let app = Arc::new(App::new(db, args.site.clone(), args.themes, notes, sbmon));
+    let app = Arc::new(App::new(db, args.site.clone(), args.themes, args.data, notes, sbmon));
     let url = advertised_url(&args.site, args.listen);
     first_run(&app, &url)?;
     let port = args.listen.port();
@@ -572,6 +589,7 @@ async fn main() -> Result<()> {
         .route("/api/sessions/{id}", delete(api::delete_session))
         .route("/api/settings", get(api::settings).put(api::save_settings))
         .route("/api/version", get(api::versions))
+        .route("/api/hub/upgrade", post(api::upgrade_hub))
         .route("/api/notify/test", post(notify::test))
         .route("/api/themes", get(api::themes))
         .route("/api/themes/{short}", delete(api::delete_theme))
@@ -921,8 +939,15 @@ mod tests {
     fn app(site: &str) -> App {
         let db = Db::open(":memory:").unwrap();
         let dir = std::env::temp_dir().join(format!("sbmon-test-{}", auth::random_token()));
-        let sbmon = sbmon::Sbmon::open(dir, &db).unwrap();
-        App::new(db, site.into(), PathBuf::from("themes"), tokio::sync::mpsc::channel(1).0, sbmon)
+        let sbmon = sbmon::Sbmon::open(dir.clone(), &db).unwrap();
+        App::new(
+            db,
+            site.into(),
+            PathBuf::from("themes"),
+            dir.clone(),
+            tokio::sync::mpsc::channel(1).0,
+            sbmon,
+        )
     }
 
     /// A request as a reverse proxy would forward it, or as it arrives with none

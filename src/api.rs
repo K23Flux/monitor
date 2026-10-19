@@ -1858,7 +1858,99 @@ pub async fn versions(_: Admin, State(app): State<Shared>) -> Json<Value> {
         // Whether the navigation marks an update. It governs the mark alone: the
         // lookup runs either way, so the update page still answers when opened.
         "notice": app.db.get("update_notice").as_deref() != Some("off"),
+        // Whether the panel may offer to upgrade this hub itself, and how the last
+        // attempt went; see `upgrade_hub`.
+        "hub_upgrade": {
+            "ready": upgrade_helper_installed(&app.data),
+            "status": upgrade_status(&app.data),
+        },
     }))
+}
+
+/// Files the hub and the upgrade helper pass between them in the data directory.
+/// The helper runs on the host as root and the hub does not, so neither holds
+/// more than a file name the other can write. `upgrade.helper` is left by the
+/// helper's installer and says it is there; `upgrade.request` holds the version
+/// the hub asks for; `upgrade.status` is the helper's answer.
+const UPGRADE_HELPER: &str = "upgrade.helper";
+const UPGRADE_REQUEST: &str = "upgrade.request";
+const UPGRADE_STATUS: &str = "upgrade.status";
+
+/// Whether a helper was installed on the host, which is what gives a request
+/// file any effect: with none, nothing reads it, so the panel must not offer
+/// the button.
+fn upgrade_helper_installed(data: &std::path::Path) -> bool {
+    data.join(UPGRADE_HELPER).exists()
+}
+
+/// What the helper last wrote: `running`, `ok`, or `failed: <why>`; empty before
+/// the first upgrade. Bounded, since the file is plain text a script wrote.
+fn upgrade_status(data: &std::path::Path) -> String {
+    let text = std::fs::read_to_string(data.join(UPGRADE_STATUS)).unwrap_or_default();
+    text.trim().chars().take(300).collect()
+}
+
+/// This fork's `1.4.1-sb.6` as the upstream version it is built on and its own
+/// counter. A plain `1.5.0` counts as `-sb.0`; anything else compares as equal.
+fn fork_version(v: &str) -> Option<(Vec<u64>, u64)> {
+    let (base, sb) = match v.split_once("-sb.") {
+        Some((base, sb)) => (base, sb.parse().ok()?),
+        None => (v, 0),
+    };
+    let parts = base.split('.').map(|p| p.parse().ok()).collect::<Option<Vec<u64>>>()?;
+    Some((parts, sb))
+}
+
+/// Whether `latest` is a later hub release than `current`, upstream version
+/// first and this fork's counter second. Unreadable versions are never behind,
+/// the same as the panel's own comparison.
+fn hub_behind(current: &str, latest: &str) -> bool {
+    let (Some((a, a_sb)), Some((b, b_sb))) = (fork_version(current), fork_version(latest)) else {
+        return false;
+    };
+    let width = a.len().max(b.len());
+    let pad = |mut v: Vec<u64>| {
+        v.resize(width, 0);
+        v
+    };
+    (pad(a), a_sb) < (pad(b), b_sb)
+}
+
+/// Asks the upgrade helper on the host to move this hub to the latest release.
+///
+/// The hub runs unprivileged and, in a container, cannot replace itself, so it
+/// only leaves a request file naming the version. A root unit on the host
+/// notices it and does the rest -- pulls the image, swaps the version in the
+/// compose file, and puts the old one back if the new hub does not come up. The
+/// helper accepts nothing from the file but a version number, and what it
+/// installs is fixed in the helper.
+pub async fn upgrade_hub(_: Admin, State(app): State<Shared>) -> Response {
+    if !upgrade_helper_installed(&app.data) {
+        return answer(
+            StatusCode::CONFLICT,
+            "这台 hub 所在的机器上还没装升级助手，装一次之后才能在这里一键升级，做法见 sbmon/README.md",
+        );
+    }
+    let latest = app.releases.lock().unwrap().hub.clone();
+    if latest.is_empty() {
+        return bad("还没查到最新版本，稍后再试");
+    }
+    if !hub_behind(env!("CARGO_PKG_VERSION"), &latest) {
+        return answer(StatusCode::CONFLICT, "已经是最新版本");
+    }
+    let request = app.data.join(UPGRADE_REQUEST);
+    if request.exists() {
+        return answer(StatusCode::CONFLICT, "升级请求已经发出，等一会儿");
+    }
+    // The previous attempt's verdict goes first, so the panel waiting on this one
+    // never reads an old failure as the new result. The directory is the hub's
+    // to write, which is enough to unlink a file root left there.
+    let _ = tokio::fs::remove_file(app.data.join(UPGRADE_STATUS)).await;
+    if let Err(e) = tokio::fs::write(&request, &latest).await {
+        return fail(anyhow::Error::from(e).context("writing the upgrade request"));
+    }
+    info!("hub upgrade to {latest} requested from the panel");
+    Json(json!({"ok": true, "latest": latest})).into_response()
 }
 
 /// Whether the cached lookup still answers. One that returned nothing is held
@@ -2340,6 +2432,31 @@ pub async fn save_settings(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_upgrade_button_needs_the_marker_the_helper_leaves_and_reads_its_verdict() {
+        let dir = std::env::temp_dir().join(format!("upgrade-test-{}", crate::auth::random_token()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!super::upgrade_helper_installed(&dir));
+        assert_eq!(super::upgrade_status(&dir), "");
+        std::fs::write(dir.join(super::UPGRADE_HELPER), "docker\n").unwrap();
+        std::fs::write(dir.join(super::UPGRADE_STATUS), "failed: 拉取镜像失败\n").unwrap();
+        assert!(super::upgrade_helper_installed(&dir));
+        assert_eq!(super::upgrade_status(&dir), "failed: 拉取镜像失败");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_fork_build_is_behind_the_next_counter_and_the_next_upstream_release() {
+        assert!(super::hub_behind("1.4.1-sb.6", "1.4.1-sb.7"));
+        assert!(super::hub_behind("1.4.1-sb.6", "1.5.0-sb.1"));
+        assert!(super::hub_behind("1.4.1-sb.6", "1.5.0"));
+        assert!(!super::hub_behind("1.4.1-sb.7", "1.4.1-sb.7"));
+        assert!(!super::hub_behind("1.4.1-sb.7", "1.4.1-sb.6"));
+        assert!(!super::hub_behind("1.5.0-sb.1", "1.4.9-sb.9"));
+        assert!(!super::hub_behind("", "1.4.1-sb.7"));
+        assert!(!super::hub_behind("1.4.1-sb.6", "nightly"));
+    }
+
     use super::*;
     // Sessions remain hashed; only node tokens are stored in the clear.
     use crate::auth::sha256;
